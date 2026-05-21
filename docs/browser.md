@@ -23,6 +23,8 @@ It is the closest thing in the desktop to a Common Lisp image browser:
 
 Use Browser when you need to inspect the living system directly rather than reason from files alone.
 
+Browser is the clearest day-to-day expression of the self-hosted introspective runtime. It is where the environment exposes loaded systems, packages, symbols, objects, and linked governed context as live engineering state rather than as reconstructed guesses from files alone.
+
 Typical tasks:
 
 - find a loaded system

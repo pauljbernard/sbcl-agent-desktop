@@ -8,6 +8,8 @@ The Recovery workspace is where incident posture and restoration obligations bec
 
 Use it when the environment is degraded, interrupted, or carrying recovery work that must be resolved before execution can be trusted again.
 
+Recovery is part of the governance model, not an external aftercare process. Incident posture, replay, validation burden, and resumable continuation are all native parts of the same self-hosted environment.
+
 ## What You Can Do Here
 
 - review open incidents

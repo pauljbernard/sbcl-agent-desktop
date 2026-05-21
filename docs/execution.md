@@ -11,6 +11,8 @@ The Execution workspace covers:
 - governed work and reconciliation
 - corrective and recovery routing after live runtime events
 
+This workspace is where the shared execution substrate and governance model become the most explicit to operators. It is the surface for direct runtime action, approval handling, governed work continuity, and the resulting evidence or recovery posture.
+
 ## Listener
 
 The Listener page is for live evaluation and runtime inspection.

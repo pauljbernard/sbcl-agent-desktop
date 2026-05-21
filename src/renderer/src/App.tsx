@@ -15,6 +15,7 @@ import type {
   ConversationAttachmentDto,
   ConsoleLogStreamDto,
   DesktopPreferencesDto,
+  DesktopRefreshEventDto,
   DesktopActionDto,
   DesktopModelDto,
   DesktopPanelStateDto,
@@ -187,6 +188,7 @@ import {
   EditorSourceFileLoadDialog,
   EditorSourceFileSaveDialog,
   EnvironmentExitDialog,
+  EnvironmentImageCreateDialog,
   EnvironmentImageChooserDialog,
   ProjectConstitutionEditDialog,
   ProjectArchitectureDecisionCreateDialog,
@@ -1712,7 +1714,7 @@ function ensureDesktopProjects(
   summary: EnvironmentSummaryDto | null
 ): ProjectProfileDto[] {
   const normalized = Array.isArray(projects) ? [...projects] : [];
-  const environmentId = summary?.environmentId ?? binding?.environmentId ?? null;
+  const environmentId = binding?.environmentId ?? summary?.environmentId ?? null;
   if (!environmentId) {
     return normalized;
   }
@@ -1835,6 +1837,7 @@ export function App() {
   const [providerProfileDraft, setProviderProfileDraft] = useState<ConfigureProviderProfileInput>(
     buildProviderProfileDraft()
   );
+  const llmOnboardingPromptShownRef = useRef(false);
   const [selectedMcpServerId, setSelectedMcpServerId] = useState<string | null>(null);
   const [mcpServerDraft, setMcpServerDraft] = useState<McpServerDraft>(buildMcpServerDraft());
   const [providerProfileStatusMessage, setProviderProfileStatusMessage] = useState<string | null>(null);
@@ -1892,6 +1895,7 @@ export function App() {
   const [pendingUpdateMemoryId, setPendingUpdateMemoryId] = useState<string | null>(null);
   const [pendingDeleteMemoryId, setPendingDeleteMemoryId] = useState<string | null>(null);
   const [selectedGovernedProjectId, setSelectedGovernedProjectId] = useState<string | null>(null);
+  const selectedGovernedProjectIdRef = useRef<string | null>(selectedGovernedProjectId);
   const [selectedProjectDetail, setSelectedProjectDetail] = useState<ProjectDetailDto | null>(null);
   const [selectedConversationThreadByProject, setSelectedConversationThreadByProject] = useState<Record<string, string>>({});
   const [replSessionsByProject, setReplSessionsByProject] = useState<Record<string, ReplSessionProfileDto[]>>({});
@@ -1999,8 +2003,12 @@ export function App() {
   const [incidentRemediationValidationDraft, setIncidentRemediationValidationDraft] = useState("");
   const [incidentRemediationBlockersDraft, setIncidentRemediationBlockersDraft] = useState("");
   const [isEnvironmentImageChooserOpen, setIsEnvironmentImageChooserOpen] = useState(false);
+  const [isStartupEnvironmentImageCreateDialogOpen, setIsStartupEnvironmentImageCreateDialogOpen] = useState(false);
   const [isEnvironmentExitDialogOpen, setIsEnvironmentExitDialogOpen] = useState(false);
   const [environmentSaveAsNameDraft, setEnvironmentSaveAsNameDraft] = useState("");
+  const [isStartupEnvironmentSelectionPending, setIsStartupEnvironmentSelectionPending] = useState(true);
+  const [startupEnvironmentImageOpenPendingId, setStartupEnvironmentImageOpenPendingId] = useState<string | null>(null);
+  const [isStartupEnvironmentImageCreatePending, setIsStartupEnvironmentImageCreatePending] = useState(false);
   const [replSessionTitleDraft, setReplSessionTitleDraft] = useState("New Listener Session");
   const [summary, setSummary] = useState<EnvironmentSummaryDto | null>(null);
   const [status, setStatus] = useState<EnvironmentStatusDto | null>(null);
@@ -2063,6 +2071,7 @@ export function App() {
   const [diagnosticReports, setDiagnosticReports] = useState<DiagnosticReportSummaryDto[]>([]);
   const [selectedDiagnosticSourceFilter, setSelectedDiagnosticSourceFilter] = useState("All Sources");
   const [selectedDiagnosticReportId, setSelectedDiagnosticReportId] = useState<string | null>(null);
+  const selectedDiagnosticReportIdRef = useRef<string | null>(selectedDiagnosticReportId);
   const [selectedDiagnosticReport, setSelectedDiagnosticReport] = useState<DiagnosticReportDetailDto | null>(null);
   const [runtimeForm, setRuntimeForm] = useState('(describe "sbcl-agent")');
   const [runtimeResult, setRuntimeResult] = useState<CommandResultDto<RuntimeEvalResultDto> | null>(null);
@@ -2095,7 +2104,12 @@ export function App() {
   const runtimeInspectorSymbolRef = useRef(runtimeInspectorSymbol);
   const runtimeInspectorPackageRef = useRef(runtimeInspectorPackage);
   const runtimeInspectionModeRef = useRef<RuntimeInspectionMode>(runtimeInspectionMode);
+  const effectiveEnvironmentIdRef = useRef<string | null>(null);
+  const selectedBrowserDomainRef = useRef<BrowserDomain>(selectedBrowserDomain);
+  const selectedConfigurationSectionRef = useRef<ConfigurationSection>(selectedConfigurationSection);
+  const selectedConsolePlaneRef = useRef<"environment" | "host">(selectedConsolePlane);
   const selectedThreadIdRef = useRef<string | null>(selectedThreadId);
+  const selectedTurnIdRef = useRef<string | null>(selectedTurnId);
   const stickyConversationThreadIdRef = useRef<string | null>(null);
   const pendingConversationApprovalRef = useRef<{
     actorMessageId?: string | null;
@@ -2127,6 +2141,7 @@ export function App() {
     useState<QueryResultDto<RuntimeEntityDetailDto> | null>(null);
   const [packageBrowser, setPackageBrowser] = useState<QueryResultDto<PackageBrowserDto> | null>(null);
   const [selectedPackageName, setSelectedPackageName] = useState<string>("");
+  const selectedPackageNameRef = useRef<string>(selectedPackageName);
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [isInspectingRuntime, setIsInspectingRuntime] = useState(false);
   const [sourcePreview, setSourcePreview] = useState<QueryResultDto<SourcePreviewDto> | null>(null);
@@ -2140,15 +2155,18 @@ export function App() {
     useState<CommandResultDto<SourceReloadResultDto> | null>(null);
   const [approvalRequests, setApprovalRequests] = useState<ApprovalRequestSummaryDto[]>([]);
   const [selectedApprovalId, setSelectedApprovalId] = useState<string | null>(null);
+  const selectedApprovalIdRef = useRef<string | null>(selectedApprovalId);
   const [selectedApproval, setSelectedApproval] = useState<ApprovalRequestDto | null>(null);
   const [approvalDecision, setApprovalDecision] = useState<CommandResultDto<ApprovalDecisionDto> | null>(null);
   const [isDecidingApproval, setIsDecidingApproval] = useState(false);
   const [incidents, setIncidents] = useState<IncidentSummaryDto[]>([]);
   const [selectedIncidentId, setSelectedIncidentId] = useState<string | null>(null);
+  const selectedIncidentIdRef = useRef<string | null>(selectedIncidentId);
   const [selectedIncident, setSelectedIncident] = useState<IncidentDetailDto | null>(null);
   const [pendingIncidentFocusId, setPendingIncidentFocusId] = useState<string | null>(null);
   const [workItems, setWorkItems] = useState<WorkItemSummaryDto[]>([]);
   const [selectedWorkItemId, setSelectedWorkItemId] = useState<string | null>(null);
+  const selectedWorkItemIdRef = useRef<string | null>(selectedWorkItemId);
   const [selectedWorkItem, setSelectedWorkItem] = useState<WorkItemDetailDto | null>(null);
   const [selectedWorkItemPlan, setSelectedWorkItemPlan] = useState<WorkItemPlanDto | null>(null);
   const [selectedWorkflowRecord, setSelectedWorkflowRecord] = useState<WorkflowRecordDto | null>(null);
@@ -2213,7 +2231,8 @@ export function App() {
     dispatchShellLayout(action);
     return nextShellLayout;
   }, []);
-  const effectiveEnvironmentId = summary?.environmentId ?? binding?.environmentId ?? null;
+  const effectiveEnvironmentId =
+    isStartupEnvironmentSelectionPending ? null : binding?.environmentId ?? summary?.environmentId ?? null;
   const desktopWindows = desktopSpaces[activeDesktopId] ?? [];
   const focusedDesktopWindowId =
     desktopFocusById[activeDesktopId] ?? desktopWindows[0]?.id ?? "window:control-panel";
@@ -2306,12 +2325,60 @@ export function App() {
   }
 
   useEffect(() => {
+    activeWorkspaceRef.current = activeWorkspace;
+  }, [activeWorkspace]);
+
+  useEffect(() => {
+    effectiveEnvironmentIdRef.current = effectiveEnvironmentId;
+  }, [effectiveEnvironmentId]);
+
+  useEffect(() => {
+    selectedBrowserDomainRef.current = selectedBrowserDomain;
+  }, [selectedBrowserDomain]);
+
+  useEffect(() => {
+    selectedConfigurationSectionRef.current = selectedConfigurationSection;
+  }, [selectedConfigurationSection]);
+
+  useEffect(() => {
+    selectedConsolePlaneRef.current = selectedConsolePlane;
+  }, [selectedConsolePlane]);
+
+  useEffect(() => {
     selectedThreadIdRef.current = selectedThreadId;
   }, [selectedThreadId]);
 
   useEffect(() => {
+    selectedTurnIdRef.current = selectedTurnId;
+  }, [selectedTurnId]);
+
+  useEffect(() => {
     pendingConversationApprovalRef.current = pendingConversationApproval;
   }, [pendingConversationApproval]);
+
+  useEffect(() => {
+    selectedPackageNameRef.current = selectedPackageName;
+  }, [selectedPackageName]);
+
+  useEffect(() => {
+    selectedApprovalIdRef.current = selectedApprovalId;
+  }, [selectedApprovalId]);
+
+  useEffect(() => {
+    selectedIncidentIdRef.current = selectedIncidentId;
+  }, [selectedIncidentId]);
+
+  useEffect(() => {
+    selectedWorkItemIdRef.current = selectedWorkItemId;
+  }, [selectedWorkItemId]);
+
+  useEffect(() => {
+    selectedDiagnosticReportIdRef.current = selectedDiagnosticReportId;
+  }, [selectedDiagnosticReportId]);
+
+  useEffect(() => {
+    selectedGovernedProjectIdRef.current = selectedGovernedProjectId;
+  }, [selectedGovernedProjectId]);
 
   useEffect(() => {
     const actorFlowPendingApproval = extractPendingConversationApprovalFromActorFlow(
@@ -3850,12 +3917,18 @@ export function App() {
       try {
         const registryResult = await window.sbclAgentDesktop.host.getEnvironmentImageRegistry();
         setEnvironmentImageRegistry(registryResult.data);
-        if (registryResult.data.images.length > 0 && !startupImageSelectionHandledRef.current) {
-          setEnvironmentSaveAsNameDraft(registryResult.data.currentImageName ?? "");
+        if (!startupImageSelectionHandledRef.current) {
+          setEnvironmentSaveAsNameDraft(
+            normalizeEnvironmentImageDraftName(
+              registryResult.data.currentImageName ?? summary?.environmentLabel ?? "work-image"
+            )
+          );
           setIsEnvironmentImageChooserOpen(true);
+          setIsStartupEnvironmentImageCreateDialogOpen(false);
           return;
         }
         await loadInitialState();
+        setIsStartupEnvironmentSelectionPending(false);
       } catch (error) {
         setErrorMessage(
           error instanceof Error ? error.message : "Failed to initialize environment images."
@@ -4360,7 +4433,9 @@ export function App() {
       if (selectedThread?.threadId === selectedThreadId) {
         return;
       }
-      void loadThreadDetail(selectedThreadId, effectiveEnvironmentId);
+      void loadThreadDetail(selectedThreadId, effectiveEnvironmentId, {
+        preserveEmptyThread: true
+      });
     }
   }, [selectedThreadId, effectiveEnvironmentId, selectedThread?.threadId]);
 
@@ -4403,41 +4478,52 @@ export function App() {
   useEffect(() => {
     if (activeWorkspace === "browser" && effectiveEnvironmentId) {
       void loadRuntimeWorkspace(effectiveEnvironmentId);
-      void loadRuntimeTelemetry(effectiveEnvironmentId);
-      void loadWorkWorkspace(effectiveEnvironmentId);
-      void loadArtifactsWorkspace(effectiveEnvironmentId);
+    }
+  }, [activeWorkspace, effectiveEnvironmentId]);
+
+  useEffect(() => {
+    if (activeWorkspace !== "browser" || !effectiveEnvironmentId) {
+      return;
+    }
+    if (selectedBrowserDomain === "linked-conversations") {
       void loadConversationWorkspace(effectiveEnvironmentId);
+      return;
+    }
+    if (selectedBrowserDomain === "governance") {
+      void loadWorkWorkspace(effectiveEnvironmentId);
       void loadApprovalWorkspace(effectiveEnvironmentId);
       void loadIncidentWorkspace(effectiveEnvironmentId);
     }
-  }, [activeWorkspace, effectiveEnvironmentId]);
+  }, [activeWorkspace, effectiveEnvironmentId, selectedBrowserDomain]);
 
   useEffect(() => {
     if ((activeWorkspace === "environment" || activeWorkspace === "projects") && effectiveEnvironmentId) {
       void loadWorkWorkspace(effectiveEnvironmentId);
       void loadApprovalWorkspace(effectiveEnvironmentId);
       void loadIncidentWorkspace(effectiveEnvironmentId);
-      const refreshTimeoutId = window.setTimeout(() => {
-        void loadWorkWorkspace(effectiveEnvironmentId);
-        void loadApprovalWorkspace(effectiveEnvironmentId);
-        void loadIncidentWorkspace(effectiveEnvironmentId);
-      }, 900);
-      return () => window.clearTimeout(refreshTimeoutId);
     }
   }, [activeWorkspace, effectiveEnvironmentId]);
 
   useEffect(() => {
     if (activeWorkspace === "configuration" && effectiveEnvironmentId) {
-      void refreshProviderSummary(effectiveEnvironmentId);
-      void refreshPackageManagementSummary(effectiveEnvironmentId);
-      void refreshDesktopTaskManifests(effectiveEnvironmentId);
-      void refreshDesktopTaskRecords(effectiveEnvironmentId);
-      void refreshDesktopTaskActorTrace(effectiveEnvironmentId);
-      void refreshDesktopTaskDeadLetters(effectiveEnvironmentId);
-      void refreshPendingConversationApproval(effectiveEnvironmentId);
-      void refreshMcpServerConfigs(effectiveEnvironmentId);
+      if (selectedConfigurationSection === "llm") {
+        void refreshProviderSummary(effectiveEnvironmentId);
+        return;
+      }
+      if (selectedConfigurationSection === "package-management") {
+        void refreshPackageManagementSummary(effectiveEnvironmentId);
+        return;
+      }
+      if (selectedConfigurationSection === "capabilities") {
+        void refreshDesktopTaskManifests(effectiveEnvironmentId);
+        void refreshDesktopTaskRecords(effectiveEnvironmentId);
+        return;
+      }
+      if (selectedConfigurationSection === "mcp-servers") {
+        void refreshMcpServerConfigs(effectiveEnvironmentId);
+      }
     }
-  }, [activeWorkspace, effectiveEnvironmentId]);
+  }, [activeWorkspace, effectiveEnvironmentId, selectedConfigurationSection]);
 
   useEffect(() => {
     if (!effectiveEnvironmentId) {
@@ -4449,6 +4535,242 @@ export function App() {
       void refreshDesktopTaskDeadLetters(effectiveEnvironmentId);
     }
   }, [activeWorkspace, effectiveEnvironmentId, selectedBrowserDomain]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let subscriptionId: string | null = null;
+    const subscribeRefreshEvents = (
+      window.sbclAgentDesktop.events as {
+        subscribeRefreshEvents?: (
+          handler: (event: DesktopRefreshEventDto) => void
+        ) => Promise<{ subscriptionId: string }>;
+      }
+    ).subscribeRefreshEvents;
+
+    const hasAnyDomain = (event: DesktopRefreshEventDto, domains: string[]): boolean =>
+      domains.some((domain) => event.domains.includes(domain));
+
+    const handleRefreshEvent = (event: DesktopRefreshEventDto): void => {
+      const environmentId = effectiveEnvironmentIdRef.current;
+      if (!environmentId) {
+        return;
+      }
+      if (event.environmentId && event.environmentId !== environmentId) {
+        return;
+      }
+
+      const active = activeWorkspaceRef.current;
+      const browserDomain = selectedBrowserDomainRef.current;
+      const configurationSection = selectedConfigurationSectionRef.current;
+      const consolePlane = selectedConsolePlaneRef.current;
+
+      if (active === "configuration") {
+        if (configurationSection === "llm" && hasAnyDomain(event, ["provider-profiles"])) {
+          void refreshProviderSummary(environmentId);
+        }
+        if (
+          configurationSection === "package-management" &&
+          hasAnyDomain(event, ["package-management", "runtime"])
+        ) {
+          void refreshPackageManagementSummary(environmentId);
+        }
+        if (configurationSection === "capabilities" && hasAnyDomain(event, ["desktop-task"])) {
+          void refreshDesktopTaskManifests(environmentId);
+          void refreshDesktopTaskRecords(environmentId);
+        }
+        if (configurationSection === "mcp-servers" && hasAnyDomain(event, ["mcp-servers", "desktop-task"])) {
+          void refreshMcpServerConfigs(environmentId);
+        }
+        return;
+      }
+
+      if (active === "conversations" && hasAnyDomain(event, ["conversations", "approvals", "work-items", "incidents"])) {
+        void loadConversationWorkspace(environmentId);
+        if (selectedThreadIdRef.current) {
+          void loadThreadDetail(selectedThreadIdRef.current, environmentId, {
+            preserveEmptyThread: true
+          });
+        }
+        if (selectedTurnIdRef.current) {
+          void loadTurnDetail(selectedTurnIdRef.current, environmentId);
+        }
+        return;
+      }
+
+      if (active === "projects" && hasAnyDomain(event, ["projects", "work-items", "incidents", "artifacts"])) {
+        void loadProjectWorkspace(environmentId);
+        if (selectedGovernedProjectIdRef.current) {
+          void loadProjectDetail(selectedGovernedProjectIdRef.current, environmentId);
+        }
+        return;
+      }
+
+      if (active === "runtime") {
+        if (hasAnyDomain(event, ["runtime", "browser", "desktop-model", "package-management"])) {
+          void loadRuntimeWorkspace(environmentId);
+        }
+        if (hasAnyDomain(event, ["work-items"])) {
+          void loadWorkWorkspace(environmentId);
+          if (selectedWorkItemIdRef.current) {
+            void loadWorkItemDetail(selectedWorkItemIdRef.current, environmentId);
+          }
+        }
+        if (hasAnyDomain(event, ["approvals"])) {
+          void loadApprovalWorkspace(environmentId);
+          if (selectedApprovalIdRef.current) {
+            void loadApprovalDetail(selectedApprovalIdRef.current, environmentId);
+          }
+        }
+        if (hasAnyDomain(event, ["incidents"])) {
+          void loadIncidentWorkspace(environmentId);
+          if (selectedIncidentIdRef.current) {
+            void loadIncidentDetail(selectedIncidentIdRef.current, environmentId);
+          }
+        }
+        if (hasAnyDomain(event, ["desktop-task"])) {
+          void refreshDesktopTaskActorSystemPanel(environmentId);
+          void refreshDesktopTaskRecords(environmentId);
+          void refreshDesktopTaskActorTrace(environmentId);
+          void refreshDesktopTaskDeadLetters(environmentId);
+        }
+        return;
+      }
+
+      if (active === "browser") {
+        if (browserDomain === "linked-conversations" && hasAnyDomain(event, ["conversations"])) {
+          void loadConversationWorkspace(environmentId);
+          return;
+        }
+        if (browserDomain === "governance") {
+          if (hasAnyDomain(event, ["work-items"])) {
+            void loadWorkWorkspace(environmentId);
+          }
+          if (hasAnyDomain(event, ["approvals"])) {
+            void loadApprovalWorkspace(environmentId);
+          }
+          if (hasAnyDomain(event, ["incidents"])) {
+            void loadIncidentWorkspace(environmentId);
+          }
+          if (hasAnyDomain(event, ["desktop-task"])) {
+            void refreshDesktopTaskRecords(environmentId);
+            void refreshDesktopTaskActorTrace(environmentId);
+            void refreshDesktopTaskDeadLetters(environmentId);
+            void refreshDesktopTaskActorSystemPanel(environmentId);
+          }
+          return;
+        }
+        if (browserDomain === "console" && hasAnyDomain(event, ["runtime", "browser", "desktop-model"])) {
+          void loadConsoleLogStream(environmentId, consolePlane);
+          return;
+        }
+        if (browserDomain === "diagnostics" && hasAnyDomain(event, ["runtime", "browser", "desktop-model"])) {
+          void loadDiagnosticReports(environmentId);
+          if (selectedDiagnosticReportIdRef.current) {
+            void loadDiagnosticReportDetail(selectedDiagnosticReportIdRef.current, environmentId);
+          }
+          return;
+        }
+        if (
+          ["processes", "performance", "host-io"].includes(browserDomain) &&
+          hasAnyDomain(event, ["runtime", "browser", "desktop-model"])
+        ) {
+          void loadRuntimeTelemetry(environmentId);
+          return;
+        }
+          if (hasAnyDomain(event, ["runtime", "browser", "desktop-model", "package-management"])) {
+            void loadRuntimeWorkspace(environmentId);
+            if (["packages", "symbols", "classes-methods"].includes(browserDomain)) {
+              void loadPackageBrowser(selectedPackageNameRef.current || undefined);
+            }
+          }
+        return;
+      }
+
+      if (active === "environment") {
+        if (hasAnyDomain(event, ["work-items"])) {
+          void loadWorkWorkspace(environmentId);
+        }
+        if (hasAnyDomain(event, ["approvals"])) {
+          void loadApprovalWorkspace(environmentId);
+        }
+        if (hasAnyDomain(event, ["incidents"])) {
+          void loadIncidentWorkspace(environmentId);
+        }
+        if (hasAnyDomain(event, ["desktop-task"])) {
+          void refreshDesktopTaskRecords(environmentId);
+          void refreshDesktopTaskActorTrace(environmentId);
+          void refreshDesktopTaskDeadLetters(environmentId);
+        }
+        return;
+      }
+
+      if (active === "work" && hasAnyDomain(event, ["work-items"])) {
+        void loadWorkWorkspace(environmentId);
+        if (selectedWorkItemIdRef.current) {
+          void loadWorkItemDetail(selectedWorkItemIdRef.current, environmentId);
+        }
+        return;
+      }
+
+      if (active === "approvals" && hasAnyDomain(event, ["approvals"])) {
+        void loadApprovalWorkspace(environmentId);
+        if (selectedApprovalIdRef.current) {
+          void loadApprovalDetail(selectedApprovalIdRef.current, environmentId);
+        }
+        return;
+      }
+
+      if (active === "incidents" && hasAnyDomain(event, ["incidents"])) {
+        void loadIncidentWorkspace(environmentId);
+        if (selectedIncidentIdRef.current) {
+          void loadIncidentDetail(selectedIncidentIdRef.current, environmentId);
+        }
+        return;
+      }
+
+      if (active === "artifacts" && hasAnyDomain(event, ["artifacts"])) {
+        void loadArtifactsWorkspace(environmentId);
+        return;
+      }
+
+      if (active === "memory" && hasAnyDomain(event, ["memory"])) {
+        void loadMemoryWorkspace(environmentId);
+      }
+    };
+
+    if (typeof subscribeRefreshEvents !== "function") {
+      console.warn("[desktop-refresh-subscription] subscribeRefreshEvents unavailable; continuing without active-view invalidation");
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void subscribeRefreshEvents((event) => {
+        if (!cancelled) {
+          handleRefreshEvent(event);
+        }
+      })
+      .then((handle) => {
+        if (cancelled) {
+          void window.sbclAgentDesktop.events.unsubscribe(handle.subscriptionId);
+          return;
+        }
+        subscriptionId = handle.subscriptionId;
+      })
+      .catch((error) => {
+        console.error(
+          "[desktop-refresh-subscription] failed: %s",
+          error instanceof Error ? error.message : String(error)
+        );
+      });
+
+    return () => {
+      cancelled = true;
+      if (subscriptionId) {
+        void window.sbclAgentDesktop.events.unsubscribe(subscriptionId);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (selectedConfigurationSection !== "mcp-servers") {
@@ -4595,10 +4917,15 @@ export function App() {
   }, [selectedDiagnosticReportId, effectiveEnvironmentId]);
 
   useEffect(() => {
-    if (activeWorkspace === "browser" && effectiveEnvironmentId && runtimeSummary?.currentPackage) {
-      void loadPackageBrowser(selectedPackageName || runtimeSummary.currentPackage);
+    if (
+      activeWorkspace === "browser" &&
+      effectiveEnvironmentId &&
+      runtimeSummary?.currentPackage &&
+      ["packages", "symbols", "classes-methods"].includes(selectedBrowserDomain)
+    ) {
+      void loadPackageBrowser(selectedPackageName || runtimeSummary.currentPackage, { includeSymbols: false });
     }
-  }, [activeWorkspace, effectiveEnvironmentId, runtimeSummary?.currentPackage, selectedPackageName]);
+  }, [activeWorkspace, effectiveEnvironmentId, runtimeSummary?.currentPackage, selectedBrowserDomain, selectedPackageName]);
 
   useEffect(() => {
     if (canonicalWorkspace(activeWorkspace) !== "browser" || !runtimeInspection?.data.items.length) {
@@ -4788,6 +5115,25 @@ export function App() {
     return desktopModelResult.data;
   }
 
+  function syncBindingFromMetadata(metadata?: { binding?: BindingDto | null } | null): void {
+    const nextBinding = metadata?.binding;
+    if (!nextBinding?.environmentId) {
+      return;
+    }
+    setBinding((current) => {
+      if (
+        current?.environmentId === nextBinding.environmentId &&
+        (current?.sessionId ?? null) === (nextBinding.sessionId ?? null)
+      ) {
+        return current;
+      }
+      return {
+        environmentId: nextBinding.environmentId,
+        sessionId: nextBinding.sessionId ?? current?.sessionId ?? "desktop-session-live"
+      };
+    });
+  }
+
   async function loadEnvironmentBootstrap(
     environmentId: string,
     restorePanelState?: Record<string, unknown> | null
@@ -4795,14 +5141,14 @@ export function App() {
     const startedAt = performance.now();
     if (!restorePanelState && typeof window.sbclAgentDesktop.query.environmentBootstrap === "function") {
       const bootstrapResult = await window.sbclAgentDesktop.query.environmentBootstrap(environmentId);
+      syncBindingFromMetadata(bootstrapResult.metadata);
       logSurfacePerf("environment.bootstrap", startedAt, { environmentId });
       return bootstrapResult.data;
     }
 
-    const [summaryResult, statusResult, workspaceSummaryResult, desktopModel] = await Promise.all([
+    const [summaryResult, statusResult, desktopModel] = await Promise.all([
       window.sbclAgentDesktop.query.environmentSummary(environmentId),
       window.sbclAgentDesktop.query.environmentStatus(environmentId),
-      window.sbclAgentDesktop.query.workspaceSummary(environmentId),
       loadDesktopShellModel(environmentId, restorePanelState)
     ]);
     logSurfacePerf("environment.bootstrap", startedAt, {
@@ -4813,7 +5159,7 @@ export function App() {
     return {
       summary: summaryResult.data,
       status: statusResult.data,
-      workspaceSummary: workspaceSummaryResult.data,
+      workspaceSummary: null,
       desktopModel
     };
   }
@@ -4835,6 +5181,12 @@ export function App() {
       );
       return null;
     }
+  }
+
+  function providerSummaryHasStoredApiKey(summary: ProviderProfileSummaryDto | null | undefined): boolean {
+    return Array.isArray(summary?.profiles)
+      ? summary!.profiles.some((profile) => profile.apiKeyPresent)
+      : false;
   }
 
   async function refreshPackageManagementSummary(
@@ -5210,8 +5562,9 @@ export function App() {
         const bootstrap = await loadEnvironmentBootstrap(nextBinding.environmentId);
         setSummary(bootstrap.summary);
         setStatus(bootstrap.status);
-        setWorkspaceSummary(bootstrap.workspaceSummary);
+        setWorkspaceSummary(bootstrap.workspaceSummary ?? null);
         setDesktopModel(bootstrap.desktopModel);
+        const nextProviderSummary = await refreshProviderSummary(nextBinding.environmentId);
         setActiveWorkspace((current) =>
           desktopPanelToWorkspaceId(bootstrap.desktopModel.activePanel, current)
         );
@@ -5222,9 +5575,18 @@ export function App() {
         );
         setProjects(nextProjects);
         setCurrentProjectId((current) => current ?? desktopPreferences.currentProjectId ?? nextProjects[0]?.projectId ?? null);
-        await refreshProviderSummary(nextBinding.environmentId);
-      } else {
-        await refreshProviderSummary();
+        if (
+          nextProviderSummary &&
+          !providerSummaryHasStoredApiKey(nextProviderSummary) &&
+          !llmOnboardingPromptShownRef.current
+        ) {
+          llmOnboardingPromptShownRef.current = true;
+          setActiveWorkspace("configuration");
+          setSelectedConfigurationSection("llm");
+          setProviderProfileStatusMessage(
+            "No stored LLM API key was found. Configure a provider profile, paste a Secure Token, then save and activate the profile."
+          );
+        }
       }
       desktopPreferencesHydratedRef.current = true;
       shellPendingHydrationActionsRef.current = [];
@@ -5240,31 +5602,89 @@ export function App() {
     return registryResult.data;
   }
 
+  function normalizeEnvironmentImageDraftName(value: unknown): string {
+    if (typeof value === "string") {
+      return value;
+    }
+
+    if (typeof value === "number") {
+      return String(value);
+    }
+
+    return "work-image";
+  }
+
   async function handleOpenEnvironmentImage(imageIdOrName: string): Promise<void> {
     try {
       startupImageSelectionHandledRef.current = true;
-      await window.sbclAgentDesktop.host.loadEnvironmentImage(imageIdOrName);
-      await refreshEnvironmentImageRegistry();
+      setStartupEnvironmentImageOpenPendingId(imageIdOrName);
+      setErrorMessage(null);
+      setSummary(null);
+      setStatus(null);
+      setWorkspaceSummary(null);
+      setDesktopModel(null);
+      const bindingResult = await window.sbclAgentDesktop.host.loadEnvironmentImage(imageIdOrName);
+      setBinding(bindingResult.data);
+      await Promise.all([refreshEnvironmentImageRegistry(), loadInitialState()]);
       setIsEnvironmentImageChooserOpen(false);
-      await loadInitialState();
+      setIsStartupEnvironmentImageCreateDialogOpen(false);
+      setIsStartupEnvironmentSelectionPending(false);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to open environment image.");
+    } finally {
+      setStartupEnvironmentImageOpenPendingId(null);
     }
   }
 
-  async function handleContinueWithCurrentEnvironmentImage(): Promise<void> {
+  function openStartupEnvironmentImageCreateDialog(): void {
+    setEnvironmentSaveAsNameDraft(
+      normalizeEnvironmentImageDraftName(
+        environmentImageRegistry?.currentImageName ?? summary?.environmentLabel ?? "work-image"
+      )
+    );
+    setIsEnvironmentImageChooserOpen(false);
+    setIsStartupEnvironmentImageCreateDialogOpen(true);
+  }
+
+  function returnToStartupEnvironmentImageChooser(): void {
+    setIsStartupEnvironmentImageCreateDialogOpen(false);
+    setIsEnvironmentImageChooserOpen(true);
+  }
+
+  async function handleSaveAsNewStartupEnvironmentImage(): Promise<void> {
+    const imageName = normalizeEnvironmentImageDraftName(environmentSaveAsNameDraft).trim();
+    if (imageName.length === 0) {
+      return;
+    }
+
     try {
       startupImageSelectionHandledRef.current = true;
+      setIsStartupEnvironmentImageCreatePending(true);
+      setErrorMessage(null);
+      setSummary(null);
+      setStatus(null);
+      setWorkspaceSummary(null);
+      setDesktopModel(null);
+      await window.sbclAgentDesktop.host.saveEnvironmentImage({
+        name: imageName,
+        overwrite: false
+      });
+      await Promise.all([refreshEnvironmentImageRegistry(), loadInitialState()]);
       setIsEnvironmentImageChooserOpen(false);
-      await loadInitialState();
+      setIsStartupEnvironmentImageCreateDialogOpen(false);
+      setIsStartupEnvironmentSelectionPending(false);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to continue with current image.");
+      setErrorMessage(error instanceof Error ? error.message : "Failed to create environment image.");
+    } finally {
+      setIsStartupEnvironmentImageCreatePending(false);
     }
   }
 
   function openEnvironmentExitDialog(): void {
     setEnvironmentSaveAsNameDraft(
-      environmentImageRegistry?.currentImageName ?? summary?.environmentLabel ?? "work-image"
+      normalizeEnvironmentImageDraftName(
+        environmentImageRegistry?.currentImageName ?? summary?.environmentLabel ?? "work-image"
+      )
     );
     setIsEnvironmentExitDialogOpen(true);
   }
@@ -5306,7 +5726,7 @@ export function App() {
   }
 
   async function handleSaveAsNewImageAndQuit(): Promise<void> {
-    const imageName = environmentSaveAsNameDraft.trim();
+    const imageName = normalizeEnvironmentImageDraftName(environmentSaveAsNameDraft).trim();
     if (imageName.length === 0) {
       return;
     }
@@ -5367,6 +5787,15 @@ export function App() {
     });
   }
 
+  function focusConversationThread(threadId: string): void {
+    stickyConversationThreadIdRef.current = threadId;
+    setSelectedThreadId(threadId);
+    setSelectedThread(null);
+    setSelectedTurnId(null);
+    setSelectedTurn(null);
+    setPendingConversationComposerFocusThreadId(threadId);
+  }
+
   async function persistReplSessions(
     nextSessionsByProject: Record<string, ReplSessionProfileDto[]>,
     nextCurrentSessionIds: Record<string, string>
@@ -5424,7 +5853,7 @@ export function App() {
     const bootstrap = await loadEnvironmentBootstrap(environmentId, restorePanelState);
     setSummary(bootstrap.summary);
     setStatus(bootstrap.status);
-    setWorkspaceSummary(bootstrap.workspaceSummary);
+    setWorkspaceSummary(bootstrap.workspaceSummary ?? null);
     setDesktopModel(bootstrap.desktopModel);
     setActiveWorkspace((current) =>
       desktopPanelToWorkspaceId(bootstrap.desktopModel.activePanel, current)
@@ -6554,11 +6983,11 @@ export function App() {
         title,
         summary: "Project-scoped conversation session created from the desktop shell."
       });
-      await loadConversationWorkspace(effectiveEnvironmentId);
-      setSelectedThreadId(result.data.threadId);
-      setSelectedThread(null);
-      setSelectedTurnId(null);
-      setSelectedTurn(null);
+      await refreshConversationThreadList(effectiveEnvironmentId, result.data.threadId);
+      focusConversationThread(result.data.threadId);
+      await loadThreadDetail(result.data.threadId, effectiveEnvironmentId, {
+        preserveEmptyThread: true
+      });
       setConversationSessionTitleDraft("");
       setIsConversationSessionCreateDialogOpen(false);
       await persistConversationThreadSelection(currentProjectId, result.data.threadId);
@@ -7504,7 +7933,7 @@ export function App() {
         turnId: selectedTurnId
       });
       if (
-        workspaceResult.data.threads.length > 0 &&
+        workspaceResult.data.threads.length === 0 &&
         allowSeedFallback &&
         !preferredThreadId &&
         typeof createConversationThread === "function"
@@ -7528,7 +7957,7 @@ export function App() {
           preferredThreadIdOverride
         );
         if (
-          threadResult.data.length > 0 &&
+          threadResult.data.length === 0 &&
           allowSeedFallback &&
           !preferredThreadId &&
           typeof createConversationThread === "function"
@@ -7829,6 +8258,7 @@ export function App() {
   async function loadRuntimeWorkspace(environmentId: string): Promise<void> {
     try {
       const result = await window.sbclAgentDesktop.query.runtimeSummary(environmentId);
+      syncBindingFromMetadata(result.metadata);
       setRuntimeSummary(result.data);
       setSelectedPackageName((current) => current || result.data.currentPackage);
       if (currentProjectId) {
@@ -8012,7 +8442,10 @@ export function App() {
     }
   }
 
-  async function loadPackageBrowser(packageName?: string): Promise<void> {
+  async function loadPackageBrowser(
+    packageName?: string,
+    options: { includeSymbols?: boolean } = {}
+  ): Promise<void> {
     if (!effectiveEnvironmentId) {
       return;
     }
@@ -8020,7 +8453,8 @@ export function App() {
     try {
       const result = await window.sbclAgentDesktop.query.packageBrowser({
         environmentId: effectiveEnvironmentId,
-        packageName
+        packageName,
+        includeSymbols: options.includeSymbols
       });
       setPackageBrowser(result);
     } catch (error) {
@@ -9351,28 +9785,28 @@ export function App() {
         }));
       }
       case "symbols": {
-        const symbols = [
-          ...(packageBrowser?.data.externalSymbols ?? []),
-          ...(packageBrowser?.data.internalSymbols ?? [])
-        ];
-        return symbols.slice(0, 4).map((symbol) => ({
-          key: `${symbol.visibility}:${symbol.symbol}`,
-          title: symbol.symbol,
-          detail: symbol.kind,
-          meta: symbol.visibility
-        }));
+        return runtimeInspection?.data.symbol
+          ? [
+              {
+                key: `${runtimeInspection.data.packageName ?? "runtime"}:${runtimeInspection.data.symbol}`,
+                title: runtimeInspection.data.symbol,
+                detail: runtimeInspection.data.summary,
+                meta: runtimeInspection.data.packageName ?? "runtime"
+              }
+            ]
+          : [];
       }
       case "classes-methods": {
-        const symbols = [
-          ...(packageBrowser?.data.externalSymbols ?? []),
-          ...(packageBrowser?.data.internalSymbols ?? [])
-        ].filter((symbol) => symbol.kind === "class" || symbol.kind === "generic-function");
-        return symbols.slice(0, 4).map((symbol) => ({
-          key: `${symbol.kind}:${symbol.symbol}`,
-          title: symbol.symbol,
-          detail: symbol.kind === "class" ? "Class" : "Generic function",
-          meta: "Live entity"
-        }));
+        return runtimeEntityDetail?.data.symbol
+          ? [
+              {
+                key: `${runtimeEntityDetail.data.packageName ?? "runtime"}:${runtimeEntityDetail.data.symbol}`,
+                title: runtimeEntityDetail.data.symbol,
+                detail: runtimeEntityDetail.data.entityKind,
+                meta: runtimeEntityDetail.data.packageName ?? "runtime"
+              }
+            ]
+          : [];
       }
       case "runtime-objects":
         return (runtimeSummary?.scopes ?? []).slice(0, 4).map((scope) => ({
@@ -10332,15 +10766,25 @@ export function App() {
       setProviderProfileError(null);
       setProviderProfileStatusMessage(null);
       const apiKey = providerProfileDraft.apiKey?.trim() ?? "";
+      const preset = llmProviderPresetForProfile(providerProfileDraft);
+      const requestedProvider = providerProfileDraft.provider.trim();
+      const requestedApiBase = providerProfileDraft.apiBase?.trim() ?? "";
+      const shouldPromoteMockProvider =
+        requestedProvider.toLowerCase() === "mock" &&
+        (requestedApiBase.length > 0 || apiKey.length > 0);
+      const resolvedProvider = shouldPromoteMockProvider
+        ? preset.provider
+        : requestedProvider || preset.provider;
       const payload: ConfigureProviderProfileInput = {
         ...providerProfileDraft,
         profileName: providerProfileDraft.profileName.trim() || "default",
+        provider: resolvedProvider,
         model: providerProfileDraft.model.trim() || llmProviderPresetForProfile(providerProfileDraft).defaultModel,
         fastModel:
           providerProfileDraft.fastModel?.trim() ||
           providerProfileDraft.model.trim() ||
           llmProviderPresetForProfile(providerProfileDraft).defaultFastModel,
-        apiBase: providerProfileDraft.apiBase?.trim() ?? "",
+        apiBase: requestedApiBase,
         intents: (providerProfileDraft.intents ?? []).map((intent) => intent.trim()).filter(Boolean),
         activate: providerProfileDraft.activate ?? false
       };
@@ -10358,6 +10802,7 @@ export function App() {
       setProviderProfileDraft((current) => ({
         ...current,
         profileName: payload.profileName,
+        provider: payload.provider,
         model: payload.model,
         fastModel: payload.fastModel,
         apiBase: payload.apiBase,
@@ -10709,11 +11154,7 @@ export function App() {
   }
 
   async function continueThread(threadId: string): Promise<void> {
-    setSelectedThreadId(threadId);
-    setSelectedThread(null);
-    setSelectedTurnId(null);
-    setSelectedTurn(null);
-    setPendingConversationComposerFocusThreadId(threadId);
+    focusConversationThread(threadId);
     if (currentProjectId) {
       await persistConversationThreadSelection(currentProjectId, threadId);
     }
@@ -11807,6 +12248,68 @@ export function App() {
   const activeLeftRailPanelEntry = resolveActiveShellRailPanel(leftRailPanelEntries, shellLayout.leftRail.activePanelId);
   const activeRightRailPanelEntry = resolveActiveShellRailPanel(rightRailPanelEntries, shellLayout.rightRail.activePanelId);
 
+  if (isStartupEnvironmentSelectionPending) {
+    return (
+      <div className="desktop-shell">
+        <div className="window-drag-strip" aria-hidden="true">
+          <div className="window-drag-label">Surface</div>
+        </div>
+
+        <div className="shell-glow shell-glow-left" />
+        <div className="shell-glow shell-glow-right" />
+
+        {errorMessage ? (
+          <section className="shell-runtime-alert" role="alert">
+            <div className="shell-runtime-alert-copy">
+              <p className="shell-runtime-alert-eyebrow">Startup</p>
+              <strong>Surface could not complete startup image selection.</strong>
+              <p>{errorMessage}</p>
+            </div>
+            <button
+              aria-label="Dismiss runtime alert"
+              className="shell-runtime-alert-dismiss"
+              onClick={() => setErrorMessage(null)}
+              type="button"
+            >
+              Dismiss
+            </button>
+          </section>
+        ) : null}
+
+        {isStartupEnvironmentImageCreateDialogOpen ? (
+          <EnvironmentImageCreateDialog
+            imageName={environmentSaveAsNameDraft}
+            isCreating={isStartupEnvironmentImageCreatePending}
+            onBack={returnToStartupEnvironmentImageChooser}
+            onCreateImage={() => void handleSaveAsNewStartupEnvironmentImage()}
+            setImageName={setEnvironmentSaveAsNameDraft}
+          />
+        ) : environmentImageRegistry ? (
+          <EnvironmentImageChooserDialog
+            pendingImageId={startupEnvironmentImageOpenPendingId}
+            onCreateImage={openStartupEnvironmentImageCreateDialog}
+            onOpenImage={(imageIdOrName) => void handleOpenEnvironmentImage(imageIdOrName)}
+            registry={environmentImageRegistry}
+          />
+        ) : (
+          <div className="project-dialog-overlay" role="presentation">
+            <section aria-label="Loading Environment Images" aria-modal="true" className="project-dialog" role="dialog">
+              <div className="project-dialog-header">
+                <div>
+                  <p className="eyebrow">Environment Images</p>
+                  <h3>Loading saved images</h3>
+                  <p className="project-dialog-copy">
+                    Surface is preparing the startup image chooser before opening the desktop.
+                  </p>
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div
       className={`desktop-shell${sidebarPinned ? "" : " sidebar-collapsed"}${canvasPinned ? "" : " canvas-collapsed"}${inspectorPinned ? "" : " inspector-collapsed"}`}
@@ -11862,14 +12365,6 @@ export function App() {
             Dismiss
           </button>
         </section>
-      ) : null}
-
-      {isEnvironmentImageChooserOpen && environmentImageRegistry ? (
-        <EnvironmentImageChooserDialog
-          onClose={() => void handleContinueWithCurrentEnvironmentImage()}
-          onOpenImage={(imageIdOrName) => void handleOpenEnvironmentImage(imageIdOrName)}
-          registry={environmentImageRegistry}
-        />
       ) : null}
 
       {isEnvironmentExitDialogOpen ? (
@@ -12666,6 +13161,7 @@ export function App() {
                 setRuntimeInspectorPackage: updateRuntimeInspectorPackage,
                 setRuntimeInspectorSymbol: updateRuntimeInspectorSymbol,
                 setSelectedThreadId,
+                focusConversationThread,
                 setSelectedTurnId,
                 openInspectorSurface: () => navigateToDesktopPanel("inspector"),
                 threads
@@ -14764,6 +15260,11 @@ function WorkspaceInspector({
                               <p className="inspector-copy">
                                 Configure the integrated language-model routing surface here. Profiles can target OpenAI, Anthropic, Gemini, xAI, Azure-hosted OpenAI-compatible endpoints, local LM Studio, or any other compatible endpoint you provide directly.
                               </p>
+                              {!(Array.isArray(providerSummary?.profiles) && providerSummary.profiles.some((profile) => profile.apiKeyPresent)) ? (
+                                <div className="configuration-error-note" role="alert">
+                                  <strong>LLM setup required.</strong> This packaged app does not ship with API tokens. Paste a provider token into <strong>Secure Token</strong>, then choose <strong>Save Profile</strong>. If you want that profile to become active immediately, enable <strong>Activate this profile after saving</strong> before saving.
+                                </div>
+                              ) : null}
                               <dl className="detail-list">
                                 <DetailRow label="Active Profile" value={providerSummary?.activeProfileName ?? "default"} />
                                 <DetailRow label="Routing Mode" value={providerSummary?.routingMode ?? "auto"} />
@@ -17673,6 +18174,11 @@ function BrowserWorkspace({
   const [symbolWorkspaceMode, setSymbolWorkspaceMode] = useState<
     "generic-function" | "class" | "macro" | "function" | "variable"
   >("function");
+  const [packageSymbolKindFilter, setPackageSymbolKindFilter] = useState<string>("all");
+  const [packageSymbolSearchTerm, setPackageSymbolSearchTerm] = useState("");
+  const [packageSymbolPage, setPackageSymbolPage] = useState(1);
+  const [packageSymbolPageSize, setPackageSymbolPageSize] = useState(16);
+  const [packageSymbolPageResult, setPackageSymbolPageResult] = useState<QueryResultDto<RuntimeSymbolBrowserPageDto> | null>(null);
   const [symbolPackageScope, setSymbolPackageScope] = useState<string>("All Packages");
   const [symbolVisibilityFilter, setSymbolVisibilityFilter] = useState<string>("all");
   const [symbolSearchTerm, setSymbolSearchTerm] = useState("");
@@ -17696,21 +18202,21 @@ function BrowserWorkspace({
   const [listenerActionMode, setListenerActionMode] = useState<"default" | "inspect" | "reload" | "evaluate" | "custom">("default");
   const [customListenerForm, setCustomListenerForm] = useState<string | null>(null);
   const previousConversationHandoffPromptRef = useRef("");
-  const packageBrowserLoadRef = useRef(new Map<string, Promise<void>>());
-  const packageBrowserPrefetchTimerRef = useRef<number | null>(null);
-  const [packageBrowserCache, setPackageBrowserCache] = useState<Record<string, PackageBrowserDto>>({});
 
   const packageNames = useMemo(
     () =>
       Array.from(
         new Set([
           ...(packageBrowser?.data.availablePackages ?? []),
+          ...(packageSymbolPageResult?.data.availablePackages ?? []),
+          ...(symbolPageResult?.data.availablePackages ?? []),
+          ...(classMethodPageResult?.data.availablePackages ?? []),
           runtimeSummary?.currentPackage,
           packageBrowser?.data.packageName,
           ...(runtimeSummary?.scopes.map((scope) => scope.packageName) ?? [])
         ].filter((value): value is string => Boolean(value)))
       ),
-    [packageBrowser, runtimeSummary]
+    [classMethodPageResult, packageBrowser, packageSymbolPageResult, runtimeSummary, symbolPageResult]
   );
   const resolvedBrowserEnvironmentId =
     packageBrowser?.metadata.binding?.environmentId ??
@@ -17719,78 +18225,6 @@ function BrowserWorkspace({
     environmentId;
   const allPackagesOption = "All Packages";
   const packageScopeOptions = [allPackagesOption, ...packageNames];
-
-  function scopedPackageNames(scope: string): string[] {
-    return scope === allPackagesOption ? packageNames : scope ? [scope] : [];
-  }
-
-  function commitPackageBrowserCacheEntries(entries: Record<string, PackageBrowserDto>): void {
-    const entryNames = Object.keys(entries);
-    if (entryNames.length === 0) {
-      return;
-    }
-    setPackageBrowserCache((current) => {
-      let changed = false;
-      const next = { ...current };
-      for (const packageName of entryNames) {
-        if (next[packageName] !== entries[packageName]) {
-          next[packageName] = entries[packageName];
-          changed = true;
-        }
-      }
-      return changed ? next : current;
-    });
-  }
-
-  async function fetchPackageBrowserData(packageName: string): Promise<PackageBrowserDto | null> {
-    if (!environmentId || !packageName) {
-      return null;
-    }
-    if (packageBrowserCache[packageName] || packageBrowser?.data.packageName === packageName) {
-      return packageBrowserCache[packageName] ?? packageBrowser?.data ?? null;
-    }
-    const result = await window.sbclAgentDesktop.query.packageBrowser({
-      environmentId,
-      packageName
-    });
-    return result.data;
-  }
-
-  async function ensurePackageBrowserData(packageName: string): Promise<void> {
-    if (!environmentId || !packageName) {
-      return;
-    }
-    if (packageBrowserCache[packageName] || packageBrowser?.data.packageName === packageName) {
-      return;
-    }
-    const existingLoad = packageBrowserLoadRef.current.get(packageName);
-    if (existingLoad) {
-      return existingLoad;
-    }
-    let loadPromise: Promise<void> | null = null;
-    loadPromise = (async () => {
-      try {
-        const result = await fetchPackageBrowserData(packageName);
-        if (!result) {
-          return;
-        }
-        commitPackageBrowserCacheEntries({ [packageName]: result });
-      } finally {
-        if (packageBrowserLoadRef.current.get(packageName) === loadPromise) {
-          packageBrowserLoadRef.current.delete(packageName);
-        }
-      }
-    })();
-    packageBrowserLoadRef.current.set(packageName, loadPromise);
-    return loadPromise;
-  }
-
-  function browserDataForPackage(packageName: string): PackageBrowserDto | null {
-    if (packageBrowser?.data.packageName === packageName) {
-      return packageBrowser.data;
-    }
-    return packageBrowserCache[packageName] ?? null;
-  }
 
   function symbolKindsForMode(mode: typeof symbolWorkspaceMode): Array<PackageBrowserSymbolDto["kind"]> {
     switch (mode) {
@@ -17810,6 +18244,20 @@ function BrowserWorkspace({
 
   function classMethodKindsForMode(mode: typeof classMethodMode): Array<PackageBrowserSymbolDto["kind"]> {
     return mode === "classes" ? ["class"] : ["generic-function"];
+  }
+
+  function packageSymbolKindsForFilter(filter: string): Array<PackageBrowserSymbolDto["kind"]> {
+    switch (filter) {
+      case "function":
+      case "variable":
+      case "macro":
+      case "class":
+      case "generic-function":
+      case "unknown":
+        return [filter];
+      default:
+        return [];
+    }
   }
 
   async function loadRuntimeSymbolPage(input: {
@@ -17833,62 +18281,6 @@ function BrowserWorkspace({
       offset: (input.page - 1) * input.pageSize,
       limit: input.pageSize
     });
-  }
-
-  function normalizeBrowserPackageData(raw: unknown, fallbackPackageName: string): {
-    packageName: string;
-    externalSymbols: PackageBrowserSymbolDto[];
-    internalSymbols: PackageBrowserSymbolDto[];
-  } {
-    if (!raw || typeof raw !== "object") {
-      return {
-        packageName: fallbackPackageName,
-        externalSymbols: [],
-        internalSymbols: []
-      };
-    }
-    const record = raw as Record<string, unknown>;
-    return {
-      packageName:
-        (typeof record.packageName === "string" && record.packageName) ||
-        (typeof record.package === "string" && record.package) ||
-        fallbackPackageName,
-      externalSymbols: Array.isArray(record.externalSymbols)
-        ? (record.externalSymbols as PackageBrowserSymbolDto[])
-        : Array.isArray(record.external_symbols)
-          ? (record.external_symbols as PackageBrowserSymbolDto[])
-          : [],
-      internalSymbols: Array.isArray(record.internalSymbols)
-        ? (record.internalSymbols as PackageBrowserSymbolDto[])
-        : Array.isArray(record.internal_symbols)
-          ? (record.internal_symbols as PackageBrowserSymbolDto[])
-          : []
-    };
-  }
-
-  function collectScopedPackageSymbols(scope: string): Array<PackageBrowserSymbolDto & { packageName: string }> {
-    return scopedPackageNames(scope)
-      .flatMap((packageName) => {
-        const browserData = browserDataForPackage(packageName);
-        if (!browserData) {
-          return [];
-        }
-        const normalized = normalizeBrowserPackageData(browserData, packageName);
-        return [
-          ...normalized.externalSymbols.map((entry) => ({ ...entry, packageName: normalized.packageName })),
-          ...normalized.internalSymbols.map((entry) => ({ ...entry, packageName: normalized.packageName }))
-        ];
-      })
-      .filter(
-        (entry, index, entries) =>
-          entries.findIndex(
-            (candidate) =>
-              candidate.packageName === entry.packageName &&
-              candidate.symbol === entry.symbol &&
-              candidate.kind === entry.kind &&
-              candidate.visibility === entry.visibility
-          ) === index
-      );
   }
 
   const browserObjective =
@@ -17947,160 +18339,75 @@ function BrowserWorkspace({
   const sourceDraftDirty =
     Boolean(sourcePreview) && sourceDraft !== (sourcePreview?.data.editableContent ?? "");
   const filteredPackageNames = packageNames;
-  const scopedSymbolEntries = useMemo(
-    () => collectScopedPackageSymbols(symbolPackageScope),
-    [packageBrowser, packageBrowserCache, packageNames, symbolPackageScope]
-  );
-  const scopedClassMethodEntries = useMemo(
-    () => collectScopedPackageSymbols(classMethodPackageScope),
-    [classMethodPackageScope, packageBrowser, packageBrowserCache, packageNames]
-  );
-
-  const kindBuckets = useMemo(
-    () => [
-      {
-        key: "generic-function",
-        title: "Generic Functions",
-        subtitle: "Method-oriented live dispatch surfaces.",
-        symbols: scopedSymbolEntries.filter((entry) => entry.kind === "generic-function"),
-        mode: "methods" as RuntimeInspectionMode
-      },
-      {
-        key: "class",
-        title: "Classes",
-        subtitle: "CLOS classes and related runtime structure.",
-        symbols: scopedSymbolEntries.filter((entry) => entry.kind === "class"),
-        mode: "definitions" as RuntimeInspectionMode
-      },
-      {
-        key: "macro",
-        title: "Macros",
-        subtitle: "Compile-time shaping forms in the selected package.",
-        symbols: scopedSymbolEntries.filter((entry) => entry.kind === "macro"),
-        mode: "definitions" as RuntimeInspectionMode
-      },
-      {
-        key: "function",
-        title: "Functions",
-        subtitle: "Callable definitions and unresolved runtime call surfaces.",
-        symbols: scopedSymbolEntries.filter((entry) => entry.kind === "function" || entry.kind === "unknown"),
-        mode: "definitions" as RuntimeInspectionMode
-      },
-      {
-        key: "variable",
-        title: "Variables",
-        subtitle: "Special variables, runtime bindings, and inspectable symbol values.",
-        symbols: scopedSymbolEntries.filter((entry) => entry.kind === "variable"),
-        mode: "describe" as RuntimeInspectionMode
-      }
-    ],
-    [scopedSymbolEntries]
-  );
-  const classBucket = {
-    key: "class",
-    symbols: scopedClassMethodEntries.filter((entry) => entry.kind === "class")
-  };
-  const genericFunctionBucket = {
-    key: "generic-function",
-    symbols: scopedClassMethodEntries.filter((entry) => entry.kind === "generic-function")
-  };
+  const kindBuckets = [
+    {
+      key: "generic-function",
+      title: "Generic Functions",
+      subtitle: "Method-oriented live dispatch surfaces.",
+      mode: "methods" as RuntimeInspectionMode
+    },
+    {
+      key: "class",
+      title: "Classes",
+      subtitle: "CLOS classes and related runtime structure.",
+      mode: "definitions" as RuntimeInspectionMode
+    },
+    {
+      key: "macro",
+      title: "Macros",
+      subtitle: "Compile-time shaping forms in the selected package.",
+      mode: "definitions" as RuntimeInspectionMode
+    },
+    {
+      key: "function",
+      title: "Functions",
+      subtitle: "Callable definitions and unresolved runtime call surfaces.",
+      mode: "definitions" as RuntimeInspectionMode
+    },
+    {
+      key: "variable",
+      title: "Variables",
+      subtitle: "Special variables, runtime bindings, and inspectable symbol values.",
+      mode: "describe" as RuntimeInspectionMode
+    }
+  ];
   const activeSymbolBucket =
     kindBuckets.find((bucket) => bucket.key === symbolWorkspaceMode) ?? kindBuckets[kindBuckets.length - 1];
-  useEffect(() => {
-    if (!packageBrowser?.data.packageName) {
-      return;
-    }
-    setPackageBrowserCache((current) =>
-      current[packageBrowser.data.packageName] === packageBrowser.data
-        ? current
-        : {
-            ...current,
-            [packageBrowser.data.packageName]: packageBrowser.data
-          }
-    );
-  }, [packageBrowser]);
 
   useEffect(() => {
-    if (!environmentId) {
+    if (!runtimeSummary?.currentPackage) {
       return;
     }
-    const requiredPackages = selectedDomain === "packages" ? scopedPackageNames(selectedPackageName) : [];
-    if (requiredPackages.length === 0) {
-      return;
+    if (symbolPackageScope === allPackagesOption) {
+      setSymbolPackageScope(runtimeSummary.currentPackage);
     }
-    if (packageBrowserPrefetchTimerRef.current !== null) {
-      window.clearTimeout(packageBrowserPrefetchTimerRef.current);
-      packageBrowserPrefetchTimerRef.current = null;
+    if (classMethodPackageScope === allPackagesOption) {
+      setClassMethodPackageScope(runtimeSummary.currentPackage);
     }
-    if (requiredPackages.length === 1) {
-      void ensurePackageBrowserData(requiredPackages[0]);
-      return;
-    }
-    let cancelled = false;
-    const pendingPackages = requiredPackages.filter(
-      (packageName) => !packageBrowserCache[packageName] && packageBrowser?.data.packageName !== packageName
-    );
-    const loadNextBatch = async () => {
-      if (cancelled || pendingPackages.length === 0) {
-        return;
-      }
-      const nextBatch = pendingPackages.splice(0, 4);
-      const loadedEntries: Record<string, PackageBrowserDto> = {};
-      for (const packageName of nextBatch) {
-        if (cancelled) {
-          return;
-        }
-        const result = await fetchPackageBrowserData(packageName);
-        if (result) {
-          loadedEntries[packageName] = result;
-        }
-      }
-      commitPackageBrowserCacheEntries(loadedEntries);
-      if (cancelled || pendingPackages.length === 0) {
-        return;
-      }
-      packageBrowserPrefetchTimerRef.current = window.setTimeout(() => {
-        void loadNextBatch();
-      }, 80);
-    };
-    void loadNextBatch();
-    return () => {
-      cancelled = true;
-      if (packageBrowserPrefetchTimerRef.current !== null) {
-        window.clearTimeout(packageBrowserPrefetchTimerRef.current);
-        packageBrowserPrefetchTimerRef.current = null;
-      }
-    };
-  }, [
-    classMethodPackageScope,
-    environmentId,
-    packageBrowser,
-    packageBrowserCache,
-    packageNames,
-    selectedDomain,
-    symbolPackageScope
-  ]);
+  }, [allPackagesOption, classMethodPackageScope, runtimeSummary?.currentPackage, symbolPackageScope]);
 
   useEffect(() => {
     if (selectedDomain !== "symbols") {
       return;
     }
     console.info(
-      "[browser-symbols] scope=%s packageCount=%d cacheCount=%d rowCount=%d lane=%s",
+      "[browser-symbols] scope=%s packageCount=%d rowCount=%d lane=%s",
       symbolPackageScope,
       packageNames.length,
-      Object.keys(packageBrowserCache).length,
       symbolPageResult?.data.items.length ?? 0,
       symbolWorkspaceMode
     );
   }, [
     symbolPageResult,
-    packageBrowserCache,
     packageNames.length,
     selectedDomain,
     symbolPackageScope,
     symbolWorkspaceMode
   ]);
+  useEffect(() => {
+    setPackageSymbolPage(1);
+  }, [packageWorkspaceMode, packageSymbolKindFilter, packageSymbolSearchTerm, packageSymbolPageSize, selectedPackageName]);
+
   useEffect(() => {
     setSymbolPage(1);
   }, [symbolPackageScope, symbolSearchTerm, symbolVisibilityFilter, symbolWorkspaceMode, symbolPageSize]);
@@ -18111,7 +18418,52 @@ function BrowserWorkspace({
 
   useEffect(() => {
     let cancelled = false;
+    if (selectedDomain !== "packages" || packageWorkspaceMode === "packages" || !selectedPackageName) {
+      return;
+    }
+    void (async () => {
+      const result = await loadRuntimeSymbolPage({
+        packageScope: selectedPackageName,
+        kinds: packageSymbolKindsForFilter(packageSymbolKindFilter),
+        visibility: packageWorkspaceMode === "exports" ? "external" : "internal",
+        search: packageSymbolSearchTerm,
+        page: packageSymbolPage,
+        pageSize: packageSymbolPageSize
+      });
+      if (!cancelled) {
+        console.info(
+          "[browser-package-page] package=%s visibility=%s total=%d items=%d page=%d pageSize=%d kind=%s",
+          selectedPackageName,
+          packageWorkspaceMode,
+          result?.data.totalCount ?? 0,
+          result?.data.items.length ?? 0,
+          packageSymbolPage,
+          packageSymbolPageSize,
+          packageSymbolKindFilter
+        );
+        setPackageSymbolPageResult(result);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    packageSymbolKindFilter,
+    packageSymbolPage,
+    packageSymbolPageSize,
+    packageSymbolSearchTerm,
+    packageWorkspaceMode,
+    resolvedBrowserEnvironmentId,
+    selectedDomain,
+    selectedPackageName
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
     if (selectedDomain !== "symbols") {
+      return;
+    }
+    if (symbolPackageScope === allPackagesOption && runtimeSummary?.currentPackage) {
       return;
     }
     void (async () => {
@@ -18140,9 +18492,11 @@ function BrowserWorkspace({
       cancelled = true;
     };
   }, [
+    allPackagesOption,
     resolvedBrowserEnvironmentId,
     environmentId,
     selectedDomain,
+    runtimeSummary?.currentPackage,
     symbolPackageScope,
     symbolWorkspaceMode,
     symbolVisibilityFilter,
@@ -18154,6 +18508,9 @@ function BrowserWorkspace({
   useEffect(() => {
     let cancelled = false;
     if (selectedDomain !== "classes-methods") {
+      return;
+    }
+    if (classMethodPackageScope === allPackagesOption && runtimeSummary?.currentPackage) {
       return;
     }
     void (async () => {
@@ -18181,9 +18538,11 @@ function BrowserWorkspace({
       cancelled = true;
     };
   }, [
+    allPackagesOption,
     classMethodMode,
     classMethodPackageScope,
     environmentId,
+    runtimeSummary?.currentPackage,
     resolvedBrowserEnvironmentId,
     classMethodPage,
     classMethodPageSize,
@@ -18351,8 +18710,6 @@ function BrowserWorkspace({
   const effectiveEntityKind =
     runtimeEntityDetail?.data.entityKind ??
     focusedPackageSymbol?.kind ??
-    (classBucket?.symbols.some((entry) => entry.symbol === focusedSymbol) ? "class" : null) ??
-    (genericFunctionBucket?.symbols.some((entry) => entry.symbol === focusedSymbol) ? "generic-function" : null) ??
     (runtimeInspection?.data.mode === "methods" ? "generic-function" : null) ??
     (runtimeInspection?.data.symbol ? "unknown" : focusedPackage ? "package" : null);
   const listenerHandoffForm = buildListenerForm({
@@ -18407,16 +18764,17 @@ function BrowserWorkspace({
     nicknameSummary: packageName === runtimeSummary?.currentPackage ? "current" : "package",
     usesSummary:
       packageName === packageBrowser?.data.packageName
-        ? `${packageBrowser?.data.useList.length ?? 0} links`
+        ? `${packageBrowser?.data.useList.length ?? 0} links · ${packageBrowser?.data.externalSymbolCount ?? 0} exports · ${
+            packageBrowser?.data.internalSymbolCount ?? 0
+          } internals`
         : "browse"
   }));
-  const packageSymbolRows = (
-    (packageWorkspaceMode === "exports" ? packageBrowser?.data.externalSymbols : packageBrowser?.data.internalSymbols) ?? []
-  ).map((entry) => ({
-    key: `${packageWorkspaceMode}:${entry.symbol}`,
+  const packageSymbolRows = (packageSymbolPageResult?.data.items ?? []).map((entry) => ({
+    key: `${packageWorkspaceMode}:${entry.packageName}:${entry.symbol}:${entry.visibility}`,
+    packageName: entry.packageName,
     symbol: entry.symbol,
     kind: entry.kind,
-    visibility: packageWorkspaceMode === "exports" ? "external" : "internal"
+    visibility: entry.visibility
   }));
   const activeSymbolRows = (symbolPageResult?.data.items ?? []).map((entry) => ({
     key: `${activeSymbolBucket.key}:${entry.visibility}:${entry.symbol}`,
@@ -18895,17 +19253,35 @@ function BrowserWorkspace({
                       }
                     ]}
                     emptyMessage="No matching symbols are available in this package lane."
-                    filterLabel="Visibility"
-                    filterOptions={buildFilterOptions(packageSymbolRows.map((row) => row.kind))}
+                    filterLabel="Kind"
+                    filterOptions={[
+                      { label: "Functions", value: "function" },
+                      { label: "Variables", value: "variable" },
+                      { label: "Macros", value: "macro" },
+                      { label: "Classes", value: "class" },
+                      { label: "Generic Functions", value: "generic-function" },
+                      { label: "Unknown", value: "unknown" }
+                    ]}
                     getFilterValue={(row) => row.kind}
                     getRowKey={(row) => row.key}
                     onSelect={(row) =>
                       void browseRuntimeEntity(
                         row.symbol,
-                        packageBrowser?.data.packageName,
+                        row.packageName,
                         row.kind === "generic-function" ? "methods" : "definitions"
                       )
                     }
+                    remotePagination={{
+                      totalRowCount: packageSymbolPageResult?.data.totalCount ?? 0,
+                      page: packageSymbolPage,
+                      pageSize: packageSymbolPageSize,
+                      searchTerm: packageSymbolSearchTerm,
+                      activeFilter: packageSymbolKindFilter,
+                      onPageChange: setPackageSymbolPage,
+                      onPageSizeChange: setPackageSymbolPageSize,
+                      onSearchTermChange: setPackageSymbolSearchTerm,
+                      onFilterChange: setPackageSymbolKindFilter
+                    }}
                     rows={packageSymbolRows}
                     searchPlaceholder={`Search ${packageWorkspaceMode} symbols`}
                     selectedKey={runtimeInspection?.data.symbol ?? runtimeEntityDetail?.data.symbol ?? null}
@@ -18974,7 +19350,8 @@ function BrowserWorkspace({
                     filterLabel="Visibility"
                     filterOptions={[
                       { label: "External", value: "external" },
-                      { label: "Internal", value: "internal" }
+                      { label: "Internal", value: "internal" },
+                      { label: "Inherited", value: "inherited" }
                     ]}
                     getFilterValue={(row) => row.visibility}
                     getRowKey={(row) => row.key}

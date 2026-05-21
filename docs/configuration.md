@@ -6,6 +6,8 @@ title: Configuration
 
 The Configuration workspace is where `Surface` exposes desktop preferences and presentation-level behavior.
 
+It is intentionally about how the self-hosted environment is projected and operated, not about redefining the environment itself. Runtime, workflow, approvals, and evidence remain environment concerns; Configuration controls how those surfaces are displayed and navigated.
+
 ## Preferences
 
 The first configuration surface is `Preferences`.

@@ -2150,20 +2150,24 @@ export function ConversationThreadRenameDialog({
 }
 
 export function EnvironmentImageChooserDialog({
-  onClose,
+  pendingImageId,
+  onCreateImage,
   onOpenImage,
   registry
 }: {
-  onClose: () => void;
+  pendingImageId?: string | null;
+  onCreateImage: () => void;
   onOpenImage: (imageIdOrName: string) => void;
   registry: EnvironmentImageRegistryDto;
 }) {
   const currentImageId = registry.currentImageId ?? null;
+  const interactionDisabled = pendingImageId != null;
 
   return (
-    <div className="project-dialog-overlay" role="presentation" onClick={onClose}>
+    <div className="project-dialog-overlay" role="presentation">
       <section
         aria-label="Open Environment Image"
+        aria-busy={interactionDisabled}
         aria-modal="true"
         className="project-dialog"
         role="dialog"
@@ -2173,16 +2177,17 @@ export function EnvironmentImageChooserDialog({
           <div>
             <p className="eyebrow">Environment Images</p>
             <h3>Select a saved image</h3>
+            <p className="project-dialog-copy">
+              Choose an existing environment image to open, or create a new one before entering Surface.
+            </p>
           </div>
-          <button className="project-dialog-close" onClick={onClose} type="button">
-            Continue
-          </button>
         </div>
         {registry.images.length > 0 ? (
           <div className="project-dialog-list">
             {registry.images.map((image) => (
               <button
                 className={image.imageId === currentImageId ? "project-dialog-item active" : "project-dialog-item"}
+                disabled={interactionDisabled}
                 key={image.imageId}
                 onClick={() => onOpenImage(image.imageId)}
                 type="button"
@@ -2194,7 +2199,9 @@ export function EnvironmentImageChooserDialog({
                 <div className="project-dialog-item-meta">
                   <span className="context-label">Updated</span>
                   <span>
-                    {image.updatedAt
+                    {pendingImageId === image.imageId
+                      ? "Opening..."
+                      : image.updatedAt
                       ? new Date(image.updatedAt * 1000).toLocaleString()
                       : "Saved image"}
                   </span>
@@ -2208,6 +2215,72 @@ export function EnvironmentImageChooserDialog({
             <h3>No saved images are available yet.</h3>
           </div>
         )}
+        <div className="project-dialog-actions">
+          <button className="project-dialog-primary" disabled={interactionDisabled} onClick={onCreateImage} type="button">
+            {interactionDisabled ? "Opening Image..." : "Create Image"}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+export function EnvironmentImageCreateDialog({
+  imageName,
+  isCreating,
+  onBack,
+  onCreateImage,
+  setImageName
+}: {
+  imageName: string;
+  isCreating?: boolean;
+  onBack: () => void;
+  onCreateImage: () => void;
+  setImageName: (value: string) => void;
+}) {
+  const normalizedImageName = typeof imageName === "string" ? imageName : "";
+
+  return (
+    <div className="project-dialog-overlay" role="presentation">
+      <section
+        aria-label="Create Environment Image"
+        aria-busy={Boolean(isCreating)}
+        aria-modal="true"
+        className="project-dialog"
+        role="dialog"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="project-dialog-header">
+          <div>
+            <p className="eyebrow">Environment Images</p>
+            <h3>Create a new image</h3>
+            <p className="project-dialog-copy">
+              Save the current environment as a new image before opening the desktop.
+            </p>
+          </div>
+        </div>
+        <label className="project-dialog-field">
+          <span className="context-label">Image Name</span>
+          <input
+            autoFocus
+            onChange={(event) => setImageName(event.target.value)}
+            placeholder="Enter image name"
+            value={normalizedImageName}
+          />
+        </label>
+        <div className="project-dialog-actions">
+          <button className="project-dialog-close" onClick={onBack} type="button">
+            Back to Images
+          </button>
+          <button
+            className="project-dialog-primary"
+            disabled={normalizedImageName.trim().length === 0 || Boolean(isCreating)}
+            onClick={onCreateImage}
+            type="button"
+          >
+            {isCreating ? "Creating Image..." : "Create Image"}
+          </button>
+        </div>
       </section>
     </div>
   );

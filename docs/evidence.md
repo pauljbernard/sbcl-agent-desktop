@@ -6,6 +6,8 @@ title: Evidence
 
 The Evidence workspace exists so artifacts and operational events can be inspected as engineering evidence, not incidental logs.
 
+It is one of the clearest surfaces for the governance model. Evidence is where actor-driven execution, approval posture, mutation consequences, incidents, and recovery traces become durable operator-visible proof.
+
 ## What It Covers
 
 - durable artifacts

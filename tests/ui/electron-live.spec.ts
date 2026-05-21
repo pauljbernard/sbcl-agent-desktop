@@ -59,7 +59,7 @@ async function launchDesktop(
     const chooser = page.getByRole("dialog", { name: "Open Environment Image" });
     await chooser.waitFor({ state: "visible", timeout: 5000 }).catch(() => undefined);
     if (await chooser.isVisible().catch(() => false)) {
-      await chooser.getByRole("button", { name: "Continue", exact: true }).click();
+      await chooser.locator(".project-dialog-item").first().click();
       await expect(chooser).toBeHidden({ timeout: 15000 });
     }
     await expect(page.locator("body")).toContainText("Shell", { timeout: 30000 });

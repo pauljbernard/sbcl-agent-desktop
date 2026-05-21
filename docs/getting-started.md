@@ -64,6 +64,8 @@ On first launch, expect three things:
 2. `Surface` may start in mock-backed mode if a live host is not configured
 3. some workspaces will show placeholder or mock environment content until a live host is bound
 
+When live mode is working correctly, `Surface` is attached to one self-hosted introspective environment runtime. Browser, Conversations, Execution, Recovery, and Configuration are then all projections over the same environment identity.
+
 The current desktop shell looks like this:
 
 ![Surface desktop snapshot](Desktop.jpg)
@@ -98,6 +100,13 @@ If you are unsure which one you are in, check the footer and the visible host/bi
 - use the listener and inspect runtime results in [Execution](execution.md)
 - review incidents and recovery obligations in [Recovery](recovery.md)
 - inspect artifacts and event history in [Evidence](evidence.md)
+
+That order is intentional. It follows the environment-first operating model:
+
+1. inspect the live runtime
+2. understand conversation and workflow continuity
+3. act through governed execution
+4. verify evidence, incident posture, and recovery state
 
 ## If The App Looks Wrong
 

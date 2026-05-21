@@ -69,6 +69,7 @@ export type ConversationsWorkspaceProps = {
   onOpenCreateConversationSession: () => void;
   onOpenRenameConversationSession: (threadId: string, title: string) => void;
   setSelectedThreadId: (threadId: string) => void;
+  focusConversationThread: (threadId: string) => void;
   setSelectedTurnId: (turnId: string) => void;
   navigateToLinkedEntity: (entity: LinkedEntityRefDto) => Promise<void>;
   openInspectorSurface: () => Promise<void>;
@@ -122,6 +123,7 @@ export function ConversationsWorkspace({
   onOpenCreateConversationSession,
   onOpenRenameConversationSession,
   setSelectedThreadId,
+  focusConversationThread,
   setSelectedTurnId,
   navigateToLinkedEntity,
   openInspectorSurface,
@@ -230,7 +232,7 @@ export function ConversationsWorkspace({
                     <button
                       className="thread-collapsed-focus-button"
                       onClick={() => {
-                        setSelectedThreadId(primaryAttentionThread.key);
+                        focusConversationThread(primaryAttentionThread.key);
                         activateConversationInspectorSection("threads");
                       }}
                       type="button"
@@ -313,7 +315,7 @@ export function ConversationsWorkspace({
                 getFilterValue={(row) => row.state}
                 getRowKey={(row) => row.key}
                 onSelect={(row) => {
-                  setSelectedThreadId(row.key);
+                  focusConversationThread(row.key);
                   activateConversationInspectorSection("threads");
                 }}
                 rows={threadRows}

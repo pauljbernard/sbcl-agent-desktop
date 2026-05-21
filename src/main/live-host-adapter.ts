@@ -179,6 +179,23 @@ interface PersistentBridgeResponseFrame {
   response: unknown;
 }
 
+type BridgeRoute = "read" | "write";
+
+interface PersistentBridgePendingEntry {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  operation: string;
+  startedAt: number;
+}
+
+interface PersistentBridgeState {
+  process: ChildProcessWithoutNullStreams | null;
+  readline: ReturnType<typeof createInterface> | null;
+  requestId: number;
+  warmupRequested: boolean;
+  pending: Map<number, PersistentBridgePendingEntry>;
+}
+
 const DEFAULT_SBCL_PATH_CANDIDATES = [
   "/opt/homebrew/bin/sbcl",
   "/usr/local/bin/sbcl",
@@ -332,7 +349,7 @@ const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function snakeToCamel(value: string): string {
-  return value.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+  return value.replace(/[-_]([a-z])/g, (_match, letter: string) => letter.toUpperCase());
 }
 
 function camelizeKeys(value: unknown): unknown {
@@ -353,7 +370,8 @@ function camelizeKeys(value: unknown): unknown {
 }
 
 function normalizeMetadata(metadata: Record<string, unknown> | undefined): ServiceMetadataDto {
-  const bindingValue = metadata?.binding;
+  const normalizedMetadata = camelizeKeys(metadata ?? {}) as Record<string, unknown>;
+  const bindingValue = normalizedMetadata.binding;
   const binding =
     bindingValue && typeof bindingValue === "object"
       ? {
@@ -366,16 +384,16 @@ function normalizeMetadata(metadata: Record<string, unknown> | undefined): Servi
   return {
     authority: "environment",
     binding,
-    readModel: metadata?.readModel as string | undefined,
-    commandModel: metadata?.commandModel as string | undefined,
-    policyId: (metadata?.policyId as string | null | undefined) ?? null,
-    threadId: (metadata?.threadId as string | null | undefined) ?? null,
-    turnId: (metadata?.turnId as string | null | undefined) ?? null,
-    workItemId: (metadata?.workItemId as string | null | undefined) ?? null,
-    workflowRecordId: (metadata?.workflowRecordId as string | null | undefined) ?? null,
-    incidentId: (metadata?.incidentId as string | null | undefined) ?? null,
-    runtimeId: (metadata?.runtimeId as string | null | undefined) ?? null,
-    eventFamily: (metadata?.eventFamily as string | null | undefined) ?? null,
+    readModel: normalizedMetadata.readModel as string | undefined,
+    commandModel: normalizedMetadata.commandModel as string | undefined,
+    policyId: (normalizedMetadata.policyId as string | null | undefined) ?? null,
+    threadId: (normalizedMetadata.threadId as string | null | undefined) ?? null,
+    turnId: (normalizedMetadata.turnId as string | null | undefined) ?? null,
+    workItemId: (normalizedMetadata.workItemId as string | null | undefined) ?? null,
+    workflowRecordId: (normalizedMetadata.workflowRecordId as string | null | undefined) ?? null,
+    incidentId: (normalizedMetadata.incidentId as string | null | undefined) ?? null,
+    runtimeId: (normalizedMetadata.runtimeId as string | null | undefined) ?? null,
+    eventFamily: (normalizedMetadata.eventFamily as string | null | undefined) ?? null,
     visibility: (metadata?.visibility as string | null | undefined) ?? null
   };
 }
@@ -1752,6 +1770,8 @@ function adaptPackageBrowserResponse(
       availablePackages,
       nicknames: asStringArray(data.nicknames),
       useList,
+      externalSymbolCount: Number(data.externalSymbolCount ?? data.external_symbol_count ?? externalSymbols.length ?? 0),
+      internalSymbolCount: Number(data.internalSymbolCount ?? data.internal_symbol_count ?? internalSymbols.length ?? 0),
       externalSymbols: externalSymbols.map(adaptSymbol),
       internalSymbols: internalSymbols.map(adaptSymbol),
       summary: String(data.summary ?? "Package browser data projected from the live runtime.")
@@ -1780,9 +1800,13 @@ function adaptRuntimeSymbolPageResponse(
       }
       return "unknown" as const;
     })(),
-    visibility: (String(entry.visibility ?? "internal") === "external" ? "external" : "internal") as
-      | "external"
-      | "internal"
+    visibility: (() => {
+      const visibility = String(entry.visibility ?? "internal");
+      if (visibility === "external" || visibility === "internal" || visibility === "inherited") {
+        return visibility as "external" | "internal" | "inherited";
+      }
+      return "internal" as const;
+    })()
   }));
   return {
     contractVersion: response.contractVersion,
@@ -3688,10 +3712,12 @@ function adaptEnvironmentBootstrapResponse(
         ...response,
         data: asRecord(data.status)
       }).data,
-      workspaceSummary: adaptWorkspaceSummaryResponse({
-        ...response,
-        data: asRecord(data.workspaceSummary)
-      }).data,
+      workspaceSummary: data.workspaceSummary
+        ? adaptWorkspaceSummaryResponse({
+            ...response,
+            data: asRecord(data.workspaceSummary)
+          }).data
+        : null,
       desktopModel: adaptDesktopModelResponse({
         ...response,
         data: asRecord(data.desktopModel)
@@ -4049,12 +4075,22 @@ function adaptConversationLatencyResponse(
 
 export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
   private currentBinding: BindingDto | null = DEFAULT_LIVE_BINDING;
-  private bridgeQueue: Promise<void> = Promise.resolve();
+  private bindingTransitionInFlight = false;
   private focusedWorkspaceOverride: WorkspaceId | null = null;
-  private persistentBridgeProcess: ChildProcessWithoutNullStreams | null = null;
-  private persistentBridgeReadline: ReturnType<typeof createInterface> | null = null;
-  private persistentBridgeRequestId = 0;
-  private persistentBridgeWarmupRequested = false;
+  private readonly readBridgeState: PersistentBridgeState = {
+    process: null,
+    readline: null,
+    requestId: 0,
+    warmupRequested: false,
+    pending: new Map()
+  };
+  private readonly writeBridgeState: PersistentBridgeState = {
+    process: null,
+    readline: null,
+    requestId: 0,
+    warmupRequested: false,
+    pending: new Map()
+  };
   private pendingEnvironmentBootstrapWarmup:
     | {
         environmentId: string;
@@ -4062,15 +4098,6 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
         promise: Promise<QueryResultDto<EnvironmentBootstrapDto>>;
       }
     | null = null;
-  private persistentBridgePending = new Map<
-    number,
-    {
-      resolve: (value: unknown) => void;
-      reject: (error: Error) => void;
-      operation: string;
-      startedAt: number;
-    }
-  >();
 
   private preferences: DesktopPreferencesDto = {
     lastWorkspace: "environment",
@@ -4128,20 +4155,20 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
   }
 
   private schedulePersistentBridgeWarmup(): void {
-    if (this.options.transport !== "pipe" || this.persistentBridgeWarmupRequested) {
+    if (this.options.transport !== "pipe" || this.readBridgeState.warmupRequested) {
       return;
     }
-    this.persistentBridgeWarmupRequested = true;
+    this.readBridgeState.warmupRequested = true;
     const startedAt = performance.now();
     try {
-      void this.ensurePersistentBridge();
+      void this.ensurePersistentBridgeForRoute("read");
       console.info(
         "[bridge-perf] operation=%s durationMs=%d status=warmup-requested transport=persistent-pipe",
         "persistent-bridge",
         Math.round(performance.now() - startedAt)
       );
     } catch (error) {
-      this.persistentBridgeWarmupRequested = false;
+      this.readBridgeState.warmupRequested = false;
       console.info(
         "[bridge-perf] operation=%s durationMs=%d status=warmup-error transport=persistent-pipe",
         "persistent-bridge",
@@ -4149,7 +4176,6 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
       );
       throw error;
     }
-    this.scheduleEnvironmentBootstrapWarmup();
   }
 
   private scheduleEnvironmentBootstrapWarmup(): void {
@@ -4191,9 +4217,108 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     });
   }
 
-  private async ensurePersistentBridge(): Promise<ChildProcessWithoutNullStreams> {
-    if (this.persistentBridgeProcess && !this.persistentBridgeProcess.killed) {
-      return this.persistentBridgeProcess;
+  private bridgeState(route: BridgeRoute): PersistentBridgeState {
+    return route === "read" ? this.readBridgeState : this.writeBridgeState;
+  }
+
+  private bridgeRouteForOperation(operation: string): BridgeRoute {
+    const readOnlyOperations = new Set([
+      "environment.bootstrap",
+      "environment.image-registry",
+      "environment.status",
+      "environment.summary",
+      "workspace.summary",
+      "desktop.show",
+      "desktop.preferences.get",
+      "events.stream",
+      "transcript.workspace",
+      "console.stream",
+      "diagnostic.list",
+      "diagnostic.detail",
+      "artifact.list",
+      "artifact.detail",
+      "conversation.workspace",
+      "conversation.thread-list",
+      "conversation.thread-detail",
+      "conversation.turn-detail",
+      "conversation.latency",
+      "memory.list",
+      "memory.detail",
+      "runtime.summary",
+      "runtime.telemetry",
+      "runtime.inspect-symbol",
+      "runtime.entity-detail",
+      "runtime.package-browser",
+      "runtime.symbol-page",
+      "filesystem.directory",
+      "source.preview",
+      "approval.list",
+      "approval.detail",
+      "incident.list",
+      "incident.detail",
+      "work-item.list",
+      "work-item.detail",
+      "work-item.plan",
+      "workflow.record-detail",
+      "environment.provider.get",
+      "package-management.summary",
+      "desktop-task.manifests",
+      "desktop-task.records",
+      "desktop-task.pending-approval",
+      "desktop-task.actor-flow",
+      "desktop-task.actor-system-panel",
+      "desktop-task.actor-trace",
+      "desktop-task.dlq",
+      "desktop-task.mcp-servers",
+      "desktop-task.mcp-server",
+      "calculator.summary",
+      "project.list",
+      "project.detail",
+      "project.testing-harness-inventory"
+    ]);
+    return readOnlyOperations.has(operation) ? "read" : "write";
+  }
+
+  private invalidateReadBridge(reason: string): void {
+    this.invalidateBridge("read", reason);
+  }
+
+  private shouldInvalidateReadBridgeAfterWrite(operation: string): boolean {
+    const nonInvalidatingWrites = new Set([
+      "desktop.preferences.set"
+    ]);
+    return !nonInvalidatingWrites.has(operation);
+  }
+
+  private invalidateBridge(route: BridgeRoute, reason: string): void {
+    if (route === "read") {
+      this.pendingEnvironmentBootstrapWarmup = null;
+    }
+    const state = this.bridgeState(route);
+    const child = state.process;
+    state.process = null;
+    state.warmupRequested = false;
+    state.readline?.close();
+    state.readline = null;
+    for (const entry of state.pending.values()) {
+      entry.reject(new Error(`${route} bridge invalidated while ${entry.operation} was pending (${reason}).`));
+    }
+    state.pending.clear();
+    if (child && !child.killed) {
+      try {
+        child.kill();
+      } catch {
+        // Ignore shutdown errors while invalidating the read bridge.
+      }
+    }
+  }
+
+  private async ensurePersistentBridgeForRoute(
+    route: BridgeRoute
+  ): Promise<ChildProcessWithoutNullStreams> {
+    const state = this.bridgeState(route);
+    if (state.process && !state.process.killed) {
+      return state.process;
     }
 
     const executable = resolveSbclExecutable();
@@ -4219,28 +4344,35 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
       stderr += chunk.toString();
     });
     child.on("error", (error) => {
-      const pending = Array.from(this.persistentBridgePending.values());
-      this.persistentBridgePending.clear();
-      this.persistentBridgeProcess = null;
-      this.persistentBridgeWarmupRequested = false;
-      this.persistentBridgeReadline?.close();
-      this.persistentBridgeReadline = null;
+      if (state.process !== child) {
+        return;
+      }
+      const pending = Array.from(state.pending.values());
+      state.pending.clear();
+      state.process = null;
+      state.warmupRequested = false;
+      state.readline?.close();
+      state.readline = null;
       for (const entry of pending) {
         entry.reject(error);
       }
     });
     child.on("close", (code) => {
-      const pending = Array.from(this.persistentBridgePending.values());
-      this.persistentBridgePending.clear();
-      this.persistentBridgeProcess = null;
-      this.persistentBridgeWarmupRequested = false;
-      this.persistentBridgeReadline?.close();
-      this.persistentBridgeReadline = null;
+      if (state.process !== child) {
+        return;
+      }
+      const pending = Array.from(state.pending.values());
+      state.pending.clear();
+      state.process = null;
+      state.warmupRequested = false;
+      state.readline?.close();
+      state.readline = null;
       for (const entry of pending) {
         console.info(
-          "[bridge-perf] operation=%s durationMs=%d status=persistent-bridge-closed code=%s stderrBytes=%d",
+          "[bridge-perf] operation=%s durationMs=%d status=%s-bridge-closed code=%s stderrBytes=%d",
           entry.operation,
           Math.round(performance.now() - entry.startedAt),
+          route,
           String(code ?? "unknown"),
           stderr.length
         );
@@ -4254,6 +4386,9 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
 
     const stdoutLines = createInterface({ input: child.stdout });
     stdoutLines.on("line", (line) => {
+      if (state.process !== child) {
+        return;
+      }
       const trimmed = line.trim();
       if (!trimmed) {
         return;
@@ -4262,23 +4397,23 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
       try {
         frame = camelizeKeys(JSON.parse(trimmed)) as PersistentBridgeResponseFrame;
       } catch (error) {
-        const pending = Array.from(this.persistentBridgePending.values());
-        this.persistentBridgePending.clear();
+        const pending = Array.from(state.pending.values());
+        state.pending.clear();
         for (const entry of pending) {
           entry.reject(error instanceof Error ? error : new Error(String(error)));
         }
         return;
       }
-      const pending = this.persistentBridgePending.get(frame.id);
+      const pending = state.pending.get(frame.id);
       if (!pending) {
         return;
       }
-      this.persistentBridgePending.delete(frame.id);
+      state.pending.delete(frame.id);
       pending.resolve(frame.response);
     });
 
-    this.persistentBridgeProcess = child;
-    this.persistentBridgeReadline = stdoutLines;
+    state.process = child;
+    state.readline = stdoutLines;
     return child;
   }
 
@@ -4304,7 +4439,8 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
 
     this.currentBinding = nextBinding;
     this.pendingEnvironmentBootstrapWarmup = null;
-    this.scheduleEnvironmentBootstrapWarmup();
+    this.invalidateBridge("read", "environment-binding-changed");
+    this.invalidateBridge("write", "environment-binding-changed");
 
     return {
       contractVersion: 1,
@@ -4337,31 +4473,45 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
   }
 
   async loadEnvironmentImage(imageIdOrName: string): Promise<CommandResultDto<BindingDto>> {
-    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
-      "environment.load-image",
-      this.currentBinding?.environmentId,
-      { imageIdOrName }
-    );
-    const summary = response.data.summary as Record<string, unknown> | undefined;
-    const environmentId =
-      (summary?.id as string | undefined) ??
-      (response.metadata?.environmentId as string | undefined) ??
-      this.currentBinding?.environmentId ??
-      DEFAULT_LIVE_BINDING.environmentId;
-    const binding: BindingDto = {
-      environmentId,
-      sessionId: this.currentBinding?.sessionId ?? DEFAULT_LIVE_BINDING.sessionId
-    };
-    this.currentBinding = binding;
-    return {
-      contractVersion: response.contractVersion,
-      domain: "host",
-      operation: "host.load_environment_image",
-      kind: "command",
-      status: response.status === "error" ? "error" : "ok",
-      data: binding,
-      metadata: normalizeMetadata(response.metadata)
-    };
+    this.bindingTransitionInFlight = true;
+    try {
+      const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+        "environment.load-image",
+        this.currentBinding?.environmentId,
+        { imageIdOrName }
+      );
+      const summary = response.data.summary as Record<string, unknown> | undefined;
+      const normalizedMetadata = camelizeKeys(response.metadata ?? {}) as Record<string, unknown>;
+      const bindingRecord =
+        normalizedMetadata.binding && typeof normalizedMetadata.binding === "object"
+          ? (normalizedMetadata.binding as Record<string, unknown>)
+          : null;
+      const environmentId =
+        (bindingRecord?.environmentId as string | undefined) ??
+        (summary?.id as string | undefined) ??
+        (normalizedMetadata.environmentId as string | undefined) ??
+        this.currentBinding?.environmentId ??
+        DEFAULT_LIVE_BINDING.environmentId;
+      const binding: BindingDto = {
+        environmentId,
+        sessionId: this.currentBinding?.sessionId ?? DEFAULT_LIVE_BINDING.sessionId
+      };
+      this.currentBinding = binding;
+      this.pendingEnvironmentBootstrapWarmup = null;
+      this.invalidateBridge("read", "environment-image-loaded");
+      this.invalidateBridge("write", "environment-image-loaded");
+      return {
+        contractVersion: response.contractVersion,
+        domain: "host",
+        operation: "host.load_environment_image",
+        kind: "command",
+        status: response.status === "error" ? "error" : "ok",
+        data: binding,
+        metadata: normalizeMetadata(response.metadata)
+      };
+    } finally {
+      this.bindingTransitionInFlight = false;
+    }
   }
 
   async saveEnvironmentImage(input: {
@@ -4398,6 +4548,9 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
       sessionId: this.currentBinding?.sessionId ?? DEFAULT_LIVE_BINDING.sessionId
     };
     this.currentBinding = binding;
+    this.pendingEnvironmentBootstrapWarmup = null;
+    this.invalidateBridge("read", "environment-image-reverted");
+    this.invalidateBridge("write", "environment-image-reverted");
     return {
       contractVersion: response.contractVersion,
       domain: "host",
@@ -4683,6 +4836,18 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
       "conversation.thread-list",
       environmentId
+    );
+    console.info(
+      "[conversation-thread-list-raw] env=%s count=%d type=%s sample=%s payload=%s",
+      environmentId ?? this.currentBinding?.environmentId ?? "none",
+      Array.isArray(response.data) ? response.data.length : -1,
+      Array.isArray(response.data)
+        ? "array"
+        : response.data == null
+          ? "null"
+          : typeof response.data,
+      Array.isArray(response.data) && response.data.length > 0 ? JSON.stringify(response.data[0]) : "none",
+      JSON.stringify(response.data)
     );
     return adaptThreadListResponse(response);
   }
@@ -5119,11 +5284,12 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
   async packageBrowser(input: {
     environmentId: string;
     packageName?: string;
+    includeSymbols?: boolean;
   }): Promise<QueryResultDto<PackageBrowserDto>> {
     const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
       "runtime.package-browser",
       input.environmentId,
-      { packageName: input.packageName }
+      { packageName: input.packageName, includeSymbols: input.includeSymbols }
     );
     return adaptPackageBrowserResponse(response);
   }
@@ -6221,6 +6387,13 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
   ): Promise<DesktopPreferencesDto> {
     const write = async (): Promise<DesktopPreferencesDto> => {
       const nextPreferences = mergeDesktopPreferences(this.preferences, patch);
+      if (this.bindingTransitionInFlight) {
+        if (patch.lastWorkspace) {
+          this.focusedWorkspaceOverride = patch.lastWorkspace;
+        }
+        this.preferences = nextPreferences;
+        return this.preferences;
+      }
       const response = await this.invokeService<RawServiceResponse<Partial<DesktopPreferencesDto>>>(
         "desktop.preferences.set",
         this.currentBinding?.environmentId,
@@ -6470,11 +6643,16 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
 
     const requested = requestedEnvironmentId?.trim();
     const meaningfulRequested = Boolean(requested) && requested !== DEFAULT_LIVE_BINDING.environmentId;
+    const currentEnvironmentId = this.currentBinding?.environmentId ?? null;
+    const driftMatchesCurrentBinding =
+      Boolean(currentEnvironmentId) && binding.environmentId === currentEnvironmentId;
 
     if (
       meaningfulRequested &&
       !this.shouldIgnoreBindingDriftForOperation(operation) &&
-      binding.environmentId !== requested
+      !this.bindingTransitionInFlight &&
+      binding.environmentId !== requested &&
+      !driftMatchesCurrentBinding
     ) {
       throw new Error(
         `Bridge binding drift for ${operation}: requested ${requested} but received ${binding.environmentId}.`
@@ -6498,57 +6676,64 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
       );
     }
 
-    return this.enqueueBridgeCall(
-      async () => {
-        const startedAt = performance.now();
-        const child = await this.ensurePersistentBridge();
-        const id = ++this.persistentBridgeRequestId;
-        const payload = {
-          id,
-          operation,
-          environmentId: environmentId ?? null,
-          request: request ?? null
-        };
-        if (operation === "runtime.symbol-page") {
-          console.info("[runtime-symbol-page-payload] %s", JSON.stringify(payload));
-        }
-        return new Promise<T>((resolvePromise, rejectPromise) => {
-          this.persistentBridgePending.set(id, {
+    const startedAt = performance.now();
+    const route = this.bridgeRouteForOperation(operation);
+    const state = this.bridgeState(route);
+    const child = await this.ensurePersistentBridgeForRoute(route);
+    const id = ++state.requestId;
+    const payload = {
+      id,
+      operation,
+      environmentId: environmentId ?? null,
+      request: request ?? null
+    };
+    if (operation === "runtime.symbol-page") {
+      console.info("[runtime-symbol-page-payload] %s", JSON.stringify(payload));
+    }
+    return new Promise<T>((resolvePromise, rejectPromise) => {
+      state.pending.set(id, {
+        operation,
+        startedAt,
+        resolve: (value) => {
+          try {
+            const parsed = value as RawServiceResponse<unknown>;
+            const binding = normalizeMetadata(parsed.metadata).binding;
+            this.adoptResponseBinding(operation, environmentId, binding);
+            if (
+              route === "write" &&
+              parsed.status === "ok" &&
+              this.shouldInvalidateReadBridgeAfterWrite(operation)
+            ) {
+              this.invalidateReadBridge(operation);
+            }
+            console.info(
+              "[bridge-perf] operation=%s durationMs=%d status=ok transport=persistent-pipe-%s",
+              operation,
+              Math.round(performance.now() - startedAt),
+              route
+            );
+            resolvePromise(parsed as T);
+          } catch (error) {
+            rejectPromise(error as Error);
+          }
+        },
+        reject: (error) => {
+          console.info(
+            "[bridge-perf] operation=%s durationMs=%d status=error transport=persistent-pipe-%s",
             operation,
-            startedAt,
-            resolve: (value) => {
-              try {
-                const parsed = value as RawServiceResponse<unknown>;
-                const binding = parsed.metadata?.binding as BindingDto | null | undefined;
-                this.adoptResponseBinding(operation, environmentId, binding);
-                console.info(
-                  "[bridge-perf] operation=%s durationMs=%d status=ok transport=persistent-pipe",
-                  operation,
-                  Math.round(performance.now() - startedAt)
-                );
-                resolvePromise(parsed as T);
-              } catch (error) {
-                rejectPromise(error as Error);
-              }
-            },
-            reject: (error) => {
-              console.info(
-                "[bridge-perf] operation=%s durationMs=%d status=error transport=persistent-pipe",
-                operation,
-                Math.round(performance.now() - startedAt)
-              );
-              rejectPromise(error);
-            }
-          });
-          child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
-            if (error) {
-              this.persistentBridgePending.delete(id);
-              rejectPromise(error);
-            }
-          });
-        });
-      }
-    );
+            Math.round(performance.now() - startedAt),
+            route
+          );
+          rejectPromise(error);
+        }
+      });
+      child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+        if (error) {
+          state.pending.delete(id);
+          rejectPromise(error);
+        }
+      });
+    });
   }
 
   private async invokeStreamingService<T>(
@@ -6563,69 +6748,67 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
       );
     }
 
-    return this.enqueueBridgeCall(
-      async () => {
-        const startedAt = performance.now();
-        const child = await this.ensurePersistentBridge();
-        const id = ++this.persistentBridgeRequestId;
-        const payload = {
-          id,
-          operation,
-          environmentId: environmentId ?? null,
-          request: request ?? null
-        };
-        if (onEvent) {
+    const startedAt = performance.now();
+    const route = this.bridgeRouteForOperation(operation);
+    const state = this.bridgeState(route);
+    const child = await this.ensurePersistentBridgeForRoute(route);
+    const id = ++state.requestId;
+    const payload = {
+      id,
+      operation,
+      environmentId: environmentId ?? null,
+      request: request ?? null
+    };
+    if (onEvent) {
+      console.info(
+        "[live-host-adapter] streaming operation=%s is using persistent bridge result mode; provider stream events are not yet forwarded inline",
+        operation
+      );
+    }
+    return new Promise<T>((resolvePromise, rejectPromise) => {
+      state.pending.set(id, {
+        operation,
+        startedAt,
+        resolve: (value) => {
+          try {
+            const parsed = value as RawServiceResponse<unknown>;
+            const binding = normalizeMetadata(parsed.metadata).binding;
+            this.adoptResponseBinding(operation, environmentId, binding);
+            if (
+              route === "write" &&
+              parsed.status === "ok" &&
+              this.shouldInvalidateReadBridgeAfterWrite(operation)
+            ) {
+              this.invalidateReadBridge(operation);
+            }
+            console.info(
+              "[bridge-perf] operation=%s durationMs=%d status=ok transport=persistent-pipe-stream-%s",
+              operation,
+              Math.round(performance.now() - startedAt),
+              route
+            );
+            resolvePromise(parsed as T);
+          } catch (error) {
+            rejectPromise(error as Error);
+          }
+        },
+        reject: (error) => {
           console.info(
-            "[live-host-adapter] streaming operation=%s is using persistent bridge result mode; provider stream events are not yet forwarded inline",
-            operation
-          );
-        }
-        return new Promise<T>((resolvePromise, rejectPromise) => {
-          this.persistentBridgePending.set(id, {
+            "[bridge-perf] operation=%s durationMs=%d status=error transport=persistent-pipe-stream-%s",
             operation,
-            startedAt,
-            resolve: (value) => {
-              try {
-                const parsed = value as RawServiceResponse<unknown>;
-                const binding = parsed.metadata?.binding as BindingDto | null | undefined;
-                this.adoptResponseBinding(operation, environmentId, binding);
-                console.info(
-                  "[bridge-perf] operation=%s durationMs=%d status=ok transport=persistent-pipe-stream",
-                  operation,
-                  Math.round(performance.now() - startedAt)
-                );
-                resolvePromise(parsed as T);
-              } catch (error) {
-                rejectPromise(error as Error);
-              }
-            },
-            reject: (error) => {
-              console.info(
-                "[bridge-perf] operation=%s durationMs=%d status=error transport=persistent-pipe-stream",
-                operation,
-                Math.round(performance.now() - startedAt)
-              );
-              rejectPromise(error);
-            }
-          });
-          child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
-            if (error) {
-              this.persistentBridgePending.delete(id);
-              rejectPromise(error);
-            }
-          });
-        });
-      }
-    );
-  }
-
-  private enqueueBridgeCall<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.bridgeQueue.then(task, task);
-    this.bridgeQueue = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
+            Math.round(performance.now() - startedAt),
+            route
+          );
+          rejectPromise(error);
+        }
+      });
+      child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+        if (error) {
+          state.pending.delete(id);
+          rejectPromise(error);
+        }
+      });
+    });
   }
 }
 

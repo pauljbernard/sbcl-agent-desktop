@@ -16,6 +16,8 @@ The desktop treats conversations as governed runtime objects with:
 - durable continuation state
 - selected-thread workspace persistence
 
+The important architectural point is that conversation is not just transcript state. A conversation thread is one control surface over the same live environment that also contains runtime entities, workflow records, approvals, incidents, and evidence.
+
 ## Threads
 
 Use `Threads` when you want the broad conversation view.

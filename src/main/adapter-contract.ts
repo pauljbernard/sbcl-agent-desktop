@@ -263,6 +263,7 @@ export interface SbclAgentHostAdapter {
   packageBrowser(input: {
     environmentId: string;
     packageName?: string;
+    includeSymbols?: boolean;
   }): Promise<QueryResultDto<PackageBrowserDto>>;
   runtimeSymbolPage(input: {
     environmentId: string;

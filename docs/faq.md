@@ -24,6 +24,10 @@ Because the product thesis assumes the running image is part of the truth of the
 
 Because they are part of real engineering work in this model. `Surface` is meant to keep those obligations visible instead of scattering them across unrelated tools.
 
+## Is Governance Separate From The Runtime?
+
+No. Governance is part of the same self-hosted environment. Approval posture, incidents, evidence, and recovery are attached to actor-driven execution rather than managed as a detached after-the-fact process.
+
 ## Where Did The Old Specs Go?
 
 They were moved to [`../eng-docs/`](../eng-docs/constitution.md). Those are engineering documents for building and extending the product, not end-user docs.

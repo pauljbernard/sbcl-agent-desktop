@@ -1282,7 +1282,7 @@ export function CommonLispEditor({
   symbolCatalog: Array<{
     symbol: string;
     kind: "function" | "variable" | "macro" | "class" | "generic-function" | "unknown";
-    visibility?: "external" | "internal";
+    visibility?: "external" | "internal" | "inherited";
     packageName?: string;
   }>;
   inspectedSymbolHelp?: {
@@ -1563,7 +1563,7 @@ export function buildCompletionOptions(
   symbolCatalog: Array<{
     symbol: string;
     kind: "function" | "variable" | "macro" | "class" | "generic-function" | "unknown";
-    visibility?: "external" | "internal";
+    visibility?: "external" | "internal" | "inherited";
     packageName?: string;
   }>,
   inspectedSymbolHelp: {
@@ -1611,7 +1611,7 @@ export function buildSymbolHelpMap(
   symbolCatalog: Array<{
     symbol: string;
     kind: "function" | "variable" | "macro" | "class" | "generic-function" | "unknown";
-    visibility?: "external" | "internal";
+    visibility?: "external" | "internal" | "inherited";
     packageName?: string;
   }>,
   inspectedSymbolHelp: {

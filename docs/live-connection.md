@@ -6,6 +6,8 @@ title: Live Connection
 
 The desktop can run in mock mode or connect to a real `sbcl-agent` host.
 
+In live mode, the desktop is not talking to a thin stateless API. It is attaching to a self-hosted introspective environment runtime. That means connection health depends on both transport health and binding correctness: the desktop, actor runtime, execution services, and live environment all need to agree on the current environment identity.
+
 ## Modes
 
 - `mock`: useful for UI development and UX review

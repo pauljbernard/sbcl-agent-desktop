@@ -56,20 +56,20 @@ flowchart LR
     Runtime --> Workflow
 ```
 
-## Execution Kernel Architecture
+## Execution And Actor Architecture
 
-At the center of that environment is the execution kernel: `invoke`, `inspect`, and `control` govern how runtime work happens, how state is read, and how policy-mediated intervention occurs.
+At the center of that environment is a shared execution substrate plus an actor runtime: `invoke`, `inspect`, and `control` govern how runtime work happens, while the actor system owns message-driven workflow continuity and governance-aware execution.
 
 ```mermaid
 flowchart TB
     React["Surface Desktop"]
     Actor["Actor System"]
-    Kernel["Governed Kernel"]
+    Core["Concurrency / Execution Core"]
     Runtime["SBCL / Common Lisp"]
 
     React --> Actor
-    Actor --> Kernel
-    Kernel --> Runtime
+    Actor --> Core
+    Core --> Runtime
 ```
 
 ## The System Keeps Three Realities Together
@@ -248,16 +248,18 @@ sequenceDiagram
     participant Chat as ContextChatActor
     participant Gov as GovernanceActor
     participant Runtime as RuntimeActor
-    participant Kernel as Governed Kernel
+    participant Core as Execution Services
 
     UI->>Chat: submit intent
     Chat->>Gov: RequestExecution
     Gov->>Runtime: AuthorizeRuntimeEvaluation
-    Runtime->>Kernel: invoke
-    Kernel-->>Runtime: result / evidence
+    Runtime->>Core: invoke
+    Core-->>Runtime: result / evidence
     Runtime-->>Chat: reply
     Chat-->>UI: project governed outcome
 ```
+
+The important change is that governance is no longer best understood as a separate kernel-era control plane. It is now part of actor execution and effect handling inside the same self-hosted environment runtime.
 
 The canonical architecture pages now live in the main repository docs:
 

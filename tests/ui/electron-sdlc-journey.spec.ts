@@ -107,7 +107,7 @@ async function waitForShellReady(page: Page): Promise<void> {
 
   const chooser = page.getByRole("dialog", { name: "Open Environment Image" });
   if (await chooser.isVisible().catch(() => false)) {
-    await chooser.getByRole("button", { name: "Continue", exact: true }).click();
+    await chooser.locator(".project-dialog-item").first().click();
     await expect(chooser).toBeHidden({ timeout: 15000 });
   }
 
@@ -173,7 +173,7 @@ async function launchDesktopAtState(
 async function openExitDialog(page: Page): Promise<void> {
   const chooser = page.getByRole("dialog", { name: "Open Environment Image" });
   if (await chooser.isVisible().catch(() => false)) {
-    await chooser.getByRole("button", { name: "Continue", exact: true }).click();
+    await chooser.locator(".project-dialog-item").first().click();
     await expect(chooser).toBeHidden({ timeout: 15000 });
   }
   const shellTabs = page.getByRole("tablist", { name: "Shell rail panels" });

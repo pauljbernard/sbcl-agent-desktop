@@ -12,6 +12,8 @@ The `Surface` shell is organized around a stable frame:
 - a right rail
 - a compact footer status dock
 
+That shell frame is projecting one self-hosted environment, not switching between unrelated application modules. Browser, Conversations, Execution, Recovery, and Configuration are different working surfaces over the same actor-governed runtime.
+
 Here is the current desktop shell in its multi-surface form:
 
 ![Surface desktop snapshot](Desktop.jpg)
@@ -70,6 +72,8 @@ This keeps the main working surface at the top of the page instead of burying it
 2. inspect the live system or conversation state
 3. act through browser, listener, or governed workflow
 4. review evidence, incidents, or closure posture
+
+That sequence is also why the inspector remains important: it helps keep actor/runtime/governance context visible while you move between surfaces instead of treating each workspace as a separate application.
 
 That sequence is intentional. `Surface` is trying to reduce the gap between inspection, action, and proof.
 
