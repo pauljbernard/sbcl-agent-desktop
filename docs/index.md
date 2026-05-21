@@ -79,6 +79,39 @@ The desktop assumes:
 - conversation is durable, but it is not the only control surface
 - approvals, incidents, work-items, and artifacts are engineering objects, not secondary metadata
 
+The deeper architectural references behind this site now center on five things:
+
+- the actor model
+- the concurrency and execution model
+- the governance model
+- context integration
+- the self-hosted introspective environment runtime
+
+## Backend Validation Baseline
+
+`Surface` is only trustworthy when the host runtime underneath it is also being validated honestly.
+
+The current backend validation set now includes:
+
+- `./bin/sbcl-agent doctor`
+- `./bin/run-concurrency-regression`
+- `./bin/run-concurrency-performance`
+- `./bin/run-actor-system-regression`
+- `./bin/run-actor-system-performance`
+
+Current documented baseline during this rebaseline:
+
+- backend health passed
+- concurrency regression passed
+- actor-system regression passed
+- actor-system performance passed
+- concurrency performance has one active enforced-budget miss on mixed-load actor dispatch latency
+
+For details, use the backend docs:
+
+- [`sbcl-agent` Testing Coverage Analysis](../../sbcl-agent/docs/testing-coverage-analysis.md)
+- [`sbcl-agent` Validation Strategy](../../sbcl-agent/docs/validation-strategy.md)
+
 ## Documentation Map
 
 - [Development Model](development-model.md): why this tool uses an environment-first, agentic workflow instead of a traditional file-first SDLC model
@@ -97,3 +130,19 @@ The desktop assumes:
 - [Live Connection](live-connection.md): connecting to a real `sbcl-agent` host
 - [Troubleshooting](troubleshooting.md): common problems and what to check first
 - [FAQ](faq.md): quick answers for common operator questions
+
+## Canonical vs Historical Architecture References
+
+When this site points back to `sbcl-agent`, prefer these as the canonical current references:
+
+- [Architecture](../../sbcl-agent/docs/architecture.md)
+- [Actor Runtime, Concurrency, And Governance](../../sbcl-agent/docs/robust-actor-kernel-architecture.md)
+- [Context Engineering](../../sbcl-agent/docs/context-engineering.md)
+- [Conversation Runtime](../../sbcl-agent/docs/conversation-architecture.md)
+
+Treat these as historical or origin-context references instead:
+
+- [Historical Baseline Assessment](../../sbcl-agent/docs/agentos-current-state-gap-analysis.md)
+- [Historical IntentOS Target Architecture](../../sbcl-agent/docs/agentos-target-state-architecture.md)
+- [IntentOS Constitution](../../sbcl-agent/docs/intentos-constitution.md)
+- [Kernel Invariants](../../sbcl-agent/docs/kernel-invariants.md)

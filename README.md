@@ -15,9 +15,9 @@ This repository does not begin with screens. It begins with the operating model 
 
 This repository defines the desktop host for the `sbcl-agent` repository.
 
-That means the frontend must not invent a simpler product story than the one `sbcl-agent` already articulates and implements. Its job is to make the underlying execution kernel, compatibility lifecycle, governance model, and operator surfaces legible, powerful, and governable for developers and engineers.
+That means the frontend must not invent a simpler product story than the one `sbcl-agent` already articulates and implements. Its job is to make the underlying actor runtime, concurrency/execution substrate, governance model, and operator surfaces legible, powerful, and governable for developers and engineers.
 
-The desktop is therefore a presentation adapter over the `sbcl-agent` environment kernel and public services. It is not a separate application model.
+The desktop is therefore a presentation adapter over the `sbcl-agent` environment runtime and public execution services. It is not a separate application model.
 
 That now includes a stronger context contract than the earlier desktop docs implied. The backend no longer ships only transcript and runtime summaries; it also ships:
 
@@ -112,12 +112,12 @@ The current stack is:
 flowchart TB
     React["React Surface Desktop"]
     Actor["Actor System"]
-    Kernel["Governed Kernel"]
+    Core["Concurrency / Execution Core"]
     Runtime["SBCL / Common Lisp Runtime"]
 
     React --> Actor
-    Actor --> Kernel
-    Kernel --> Runtime
+    Actor --> Core
+    Core --> Runtime
 ```
 
 The planning and context path now matters as much as the execution path. `Surface` increasingly hosts a backend that already distinguishes:
@@ -134,7 +134,7 @@ The desktop does not yet expose every one of those packet sections as a named pa
 The authoritative architecture references now live in the main `sbcl-agent` docs:
 
 - [Architecture and Design](../sbcl-agent/docs/architecture.md)
-- [Actor Runtime And Governed Kernel](../sbcl-agent/docs/robust-actor-kernel-architecture.md)
+- [Actor Runtime, Concurrency, And Governance](../sbcl-agent/docs/robust-actor-kernel-architecture.md)
 - [Actor System Surface](../sbcl-agent/docs/actor-system-panel.md)
 - [Conversation Runtime](../sbcl-agent/docs/conversation-architecture.md)
 
@@ -199,7 +199,7 @@ That separation is intentional. User docs explain how to operate the desktop. En
 These specs are derived from the current `sbcl-agent` architecture and documentation, especially:
 
 - the environment-first framing
-- the execution-kernel transition
+- the actor-runtime and execution-core transition
 - the `invoke` / `inspect` / `control` boundary
 - the conversation/runtime/workflow ownership rule
 - the compatibility translation rule of preserving powers while discarding old metaphors

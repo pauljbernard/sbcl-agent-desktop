@@ -15,6 +15,7 @@ import type {
   DesktopActionInput,
   DesktopRestoreInput,
   DesktopPreferencesDto,
+  DesktopRefreshEventDto,
   DocumentationPageDto,
   DocumentationPageSummaryDto,
   EntityRefDto,
@@ -40,10 +41,130 @@ import type {
 
 const eventHandlers = new Map<string, (event: EnvironmentEventDto) => void>();
 const pendingEvents = new Map<string, EnvironmentEventDto[]>();
+const refreshHandlers = new Map<string, (event: DesktopRefreshEventDto) => void>();
 const conversationStreamHandlers = new Map<string, (event: EnvironmentEventDto) => void>();
 const menuActionHandlers = new Map<string, (action: string) => void>();
 let nextConversationStreamSubscriptionId = 1;
 let nextMenuActionSubscriptionId = 1;
+let nextRefreshSubscriptionId = 1;
+
+function emitRefreshEvent(event: DesktopRefreshEventDto): void {
+  for (const handler of refreshHandlers.values()) {
+    handler(event);
+  }
+}
+
+function inferRefreshEventFromChannel(
+  channel: string,
+  payload: unknown,
+  result: unknown
+): DesktopRefreshEventDto | null {
+  const payloadRecord = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
+  const resultRecord = result && typeof result === "object" ? (result as Record<string, unknown>) : null;
+  const dataRecord =
+    resultRecord?.data && typeof resultRecord.data === "object"
+      ? (resultRecord.data as Record<string, unknown>)
+      : null;
+  const metadataRecord =
+    resultRecord?.metadata && typeof resultRecord.metadata === "object"
+      ? (resultRecord.metadata as Record<string, unknown>)
+      : null;
+  const bindingRecord =
+    metadataRecord?.binding && typeof metadataRecord.binding === "object"
+      ? (metadataRecord.binding as Record<string, unknown>)
+      : null;
+  const environmentId =
+    (payloadRecord?.environmentId as string | undefined) ??
+    (bindingRecord?.environmentId as string | undefined) ??
+    null;
+
+  const domains =
+    channel.startsWith("command:create-project") ||
+    channel.startsWith("command:update-project") ||
+    channel.startsWith("command:append-project") ||
+    channel.startsWith("command:bind-project")
+      ? ["projects", "work-items", "artifacts"]
+      : channel.startsWith("command:update-incident-remediation-plan")
+        ? ["incidents", "work-items"]
+        : channel.startsWith("command:resume-work-item") ||
+            channel.startsWith("command:quarantine-work-item") ||
+            channel.startsWith("command:rollback-work-item") ||
+            channel.startsWith("command:complete-work-item-validations") ||
+            channel.startsWith("command:steer-work-item")
+          ? ["work-items", "incidents", "approvals", "artifacts"]
+          : channel.startsWith("command:create-conversation-thread") ||
+              channel.startsWith("command:update-conversation-thread") ||
+              channel.startsWith("command:send-conversation-message") ||
+              channel.startsWith("command:approve-actor-message") ||
+              channel.startsWith("command:approve-approval") ||
+              channel.startsWith("command:approve-request") ||
+              channel.startsWith("command:deny-request")
+            ? ["conversations", "approvals", "work-items", "incidents"]
+            : channel.startsWith("command:update-memory") || channel.startsWith("command:delete-memory")
+              ? ["memory"]
+              : channel.startsWith("command:evaluate-in-context") ||
+                  channel.startsWith("command:stage-source-change") ||
+                  channel.startsWith("command:write-source-file") ||
+                  channel.startsWith("command:reload-source-file") ||
+                  channel.startsWith("command:desktop-action") ||
+                  channel.startsWith("command:desktop-restore")
+                ? ["runtime", "browser", "desktop-model"]
+                : channel.startsWith("command:configure-provider-profile") ||
+                    channel.startsWith("command:use-provider-profile") ||
+                    channel.startsWith("command:update-provider-routing")
+                  ? ["provider-profiles"]
+                  : channel.startsWith("command:configure-mcp-server") ||
+                      channel.startsWith("command:remove-mcp-server")
+                    ? ["mcp-servers", "desktop-task"]
+                    : channel.startsWith("command:install-quicklisp-package") ||
+                        channel.startsWith("command:run-qlot-command") ||
+                        channel.startsWith("command:add-source-registry-entry") ||
+                        channel.startsWith("command:update-source-registry-entry") ||
+                        channel.startsWith("command:remove-source-registry-entry") ||
+                        channel.startsWith("command:add-local-project") ||
+                        channel.startsWith("command:remove-local-project")
+                      ? ["package-management", "runtime", "browser"]
+                      : channel.startsWith("command:evaluate-calculator") ||
+                          channel.startsWith("command:set-calculator-") ||
+                          channel.startsWith("command:append-calculator-token") ||
+                          channel.startsWith("command:backspace-calculator") ||
+                          channel.startsWith("command:clear-calculator")
+                        ? ["calculator"]
+                        : channel.startsWith("host:load-environment-image") ||
+                            channel.startsWith("host:save-environment-image") ||
+                            channel.startsWith("host:revert-environment-image")
+                          ? ["environment-binding", "desktop-model", "provider-profiles", "package-management"]
+                          : [];
+
+  if (domains.length === 0) {
+    return null;
+  }
+
+  return {
+    environmentId,
+    domains,
+    reason: channel,
+    source: "presentation-command",
+    timestamp: new Date().toISOString(),
+    entityId:
+      (dataRecord?.projectId as string | undefined) ??
+      (dataRecord?.threadId as string | undefined) ??
+      (dataRecord?.workItemId as string | undefined) ??
+      null
+  };
+}
+
+async function invokeCommandWithRefresh<T>(
+  channel: string,
+  payload?: unknown
+): Promise<T> {
+  const result = await ipcRenderer.invoke(channel, payload);
+  const refreshEvent = inferRefreshEventFromChannel(channel, payload, result);
+  if (refreshEvent) {
+    emitRefreshEvent(refreshEvent);
+  }
+  return result as T;
+}
 
 ipcRenderer.on(
   "events:subscription-event",
@@ -80,10 +201,10 @@ const api: SbclAgentDesktopApi = {
       ipcRenderer.invoke("host:set-environment-binding", environmentId),
     getEnvironmentImageRegistry: () => ipcRenderer.invoke("host:get-environment-image-registry"),
     loadEnvironmentImage: (imageIdOrName: string) =>
-      ipcRenderer.invoke("host:load-environment-image", imageIdOrName),
+      invokeCommandWithRefresh("host:load-environment-image", imageIdOrName),
     saveEnvironmentImage: (input: { name: string; overwrite?: boolean }) =>
-      ipcRenderer.invoke("host:save-environment-image", input),
-    revertEnvironmentToImage: () => ipcRenderer.invoke("host:revert-environment-image")
+      invokeCommandWithRefresh("host:save-environment-image", input),
+    revertEnvironmentToImage: () => invokeCommandWithRefresh("host:revert-environment-image")
   },
   query: {
     projectList: (environmentId?: string) => ipcRenderer.invoke("query:project-list", environmentId),
@@ -199,85 +320,85 @@ const api: SbclAgentDesktopApi = {
       ipcRenderer.invoke("query:calculator-summary", environmentId)
   },
   command: {
-    createIntent: (input) => ipcRenderer.invoke("command:create-intent", input),
-    createProject: (input) => ipcRenderer.invoke("command:create-project", input),
-    updateProjectConstitution: (input) => ipcRenderer.invoke("command:update-project-constitution", input),
-    updateProjectDesignSystem: (input) => ipcRenderer.invoke("command:update-project-design-system", input),
-    updateProjectStyleGuide: (input) => ipcRenderer.invoke("command:update-project-style-guide", input),
-    updateProjectTestingStrategy: (input) => ipcRenderer.invoke("command:update-project-testing-strategy", input),
-    updateProjectReleaseReadiness: (input) => ipcRenderer.invoke("command:update-project-release-readiness", input),
-    updateProjectReadinessObligations: (input) => ipcRenderer.invoke("command:update-project-readiness-obligations", input),
-    appendProjectRequirement: (input) => ipcRenderer.invoke("command:append-project-requirement", input),
+    createIntent: (input) => invokeCommandWithRefresh("command:create-intent", input),
+    createProject: (input) => invokeCommandWithRefresh("command:create-project", input),
+    updateProjectConstitution: (input) => invokeCommandWithRefresh("command:update-project-constitution", input),
+    updateProjectDesignSystem: (input) => invokeCommandWithRefresh("command:update-project-design-system", input),
+    updateProjectStyleGuide: (input) => invokeCommandWithRefresh("command:update-project-style-guide", input),
+    updateProjectTestingStrategy: (input) => invokeCommandWithRefresh("command:update-project-testing-strategy", input),
+    updateProjectReleaseReadiness: (input) => invokeCommandWithRefresh("command:update-project-release-readiness", input),
+    updateProjectReadinessObligations: (input) => invokeCommandWithRefresh("command:update-project-readiness-obligations", input),
+    appendProjectRequirement: (input) => invokeCommandWithRefresh("command:append-project-requirement", input),
     appendProjectFeatureSpecification: (input) =>
-      ipcRenderer.invoke("command:append-project-feature-specification", input),
-    appendProjectUserJourney: (input) => ipcRenderer.invoke("command:append-project-user-journey", input),
+      invokeCommandWithRefresh("command:append-project-feature-specification", input),
+    appendProjectUserJourney: (input) => invokeCommandWithRefresh("command:append-project-user-journey", input),
     appendProjectArchitectureDecision: (input) =>
-      ipcRenderer.invoke("command:append-project-architecture-decision", input),
-    appendProjectSourceRoot: (input) => ipcRenderer.invoke("command:append-project-source-root", input),
-    bindProjectTestingHarness: (input) => ipcRenderer.invoke("command:bind-project-testing-harness", input),
-    appendProjectQualityGate: (input) => ipcRenderer.invoke("command:append-project-quality-gate", input),
+      invokeCommandWithRefresh("command:append-project-architecture-decision", input),
+    appendProjectSourceRoot: (input) => invokeCommandWithRefresh("command:append-project-source-root", input),
+    bindProjectTestingHarness: (input) => invokeCommandWithRefresh("command:bind-project-testing-harness", input),
+    appendProjectQualityGate: (input) => invokeCommandWithRefresh("command:append-project-quality-gate", input),
     updateIncidentRemediationPlan: (input) =>
-      ipcRenderer.invoke("command:update-incident-remediation-plan", input),
-    resumeWorkItem: (input) => ipcRenderer.invoke("command:resume-work-item", input),
-    quarantineWorkItem: (input) => ipcRenderer.invoke("command:quarantine-work-item", input),
-    rollbackWorkItem: (input) => ipcRenderer.invoke("command:rollback-work-item", input),
-    completeWorkItemValidations: (input) => ipcRenderer.invoke("command:complete-work-item-validations", input),
-    steerWorkItem: (input) => ipcRenderer.invoke("command:steer-work-item", input),
-    createConversationThread: (input) => ipcRenderer.invoke("command:create-conversation-thread", input),
-    updateConversationThread: (input) => ipcRenderer.invoke("command:update-conversation-thread", input),
+      invokeCommandWithRefresh("command:update-incident-remediation-plan", input),
+    resumeWorkItem: (input) => invokeCommandWithRefresh("command:resume-work-item", input),
+    quarantineWorkItem: (input) => invokeCommandWithRefresh("command:quarantine-work-item", input),
+    rollbackWorkItem: (input) => invokeCommandWithRefresh("command:rollback-work-item", input),
+    completeWorkItemValidations: (input) => invokeCommandWithRefresh("command:complete-work-item-validations", input),
+    steerWorkItem: (input) => invokeCommandWithRefresh("command:steer-work-item", input),
+    createConversationThread: (input) => invokeCommandWithRefresh("command:create-conversation-thread", input),
+    updateConversationThread: (input) => invokeCommandWithRefresh("command:update-conversation-thread", input),
     updateMemory: (input: MemoryUpdateInput): Promise<CommandResultDto<MemoryEntryDto>> =>
-      ipcRenderer.invoke("command:update-memory", input),
+      invokeCommandWithRefresh("command:update-memory", input),
     deleteMemory: (input: MemoryDeleteInput): Promise<CommandResultDto<MemoryDeleteResultDto>> =>
-      ipcRenderer.invoke("command:delete-memory", input),
-    sendConversationMessage: (input) => ipcRenderer.invoke("command:send-conversation-message", input),
-    approveActorMessage: (input) => ipcRenderer.invoke("command:approve-actor-message", input),
-    approveApproval: (input) => ipcRenderer.invoke("command:approve-approval", input),
+      invokeCommandWithRefresh("command:delete-memory", input),
+    sendConversationMessage: (input) => invokeCommandWithRefresh("command:send-conversation-message", input),
+    approveActorMessage: (input) => invokeCommandWithRefresh("command:approve-actor-message", input),
+    approveApproval: (input) => invokeCommandWithRefresh("command:approve-approval", input),
     extractConversationAttachmentText: (input) =>
       ipcRenderer.invoke("command:extract-conversation-attachment-text", input),
-    evaluateInContext: (input) => ipcRenderer.invoke("command:evaluate-in-context", input),
+    evaluateInContext: (input) => invokeCommandWithRefresh("command:evaluate-in-context", input),
     evaluateCalculator: (input: CalculatorEvaluateInput): Promise<CommandResultDto<CalculatorResultDto>> =>
-      ipcRenderer.invoke("command:evaluate-calculator", input),
+      invokeCommandWithRefresh("command:evaluate-calculator", input),
     setCalculatorExpression: (input: CalculatorSetExpressionInput): Promise<CommandResultDto<CalculatorSummaryDto>> =>
-      ipcRenderer.invoke("command:set-calculator-expression", input),
+      invokeCommandWithRefresh("command:set-calculator-expression", input),
     appendCalculatorToken: (input: CalculatorAppendTokenInput): Promise<CommandResultDto<CalculatorSummaryDto>> =>
-      ipcRenderer.invoke("command:append-calculator-token", input),
+      invokeCommandWithRefresh("command:append-calculator-token", input),
     backspaceCalculator: (environmentId: string): Promise<CommandResultDto<CalculatorSummaryDto>> =>
-      ipcRenderer.invoke("command:backspace-calculator", environmentId),
+      invokeCommandWithRefresh("command:backspace-calculator", environmentId),
     clearCalculator: (environmentId: string): Promise<CommandResultDto<CalculatorSummaryDto>> =>
-      ipcRenderer.invoke("command:clear-calculator", environmentId),
+      invokeCommandWithRefresh("command:clear-calculator", environmentId),
     setCalculatorMode: (input: CalculatorSetModeInput): Promise<CommandResultDto<CalculatorSummaryDto>> =>
-      ipcRenderer.invoke("command:set-calculator-mode", input),
+      invokeCommandWithRefresh("command:set-calculator-mode", input),
     setCalculatorBase: (input: CalculatorSetBaseInput): Promise<CommandResultDto<CalculatorSummaryDto>> =>
-      ipcRenderer.invoke("command:set-calculator-base", input),
+      invokeCommandWithRefresh("command:set-calculator-base", input),
     setCalculatorWordSize: (input: CalculatorSetWordSizeInput): Promise<CommandResultDto<CalculatorSummaryDto>> =>
-      ipcRenderer.invoke("command:set-calculator-word-size", input),
+      invokeCommandWithRefresh("command:set-calculator-word-size", input),
     setCalculatorAngleUnit: (input: CalculatorSetAngleUnitInput): Promise<CommandResultDto<CalculatorSummaryDto>> =>
-      ipcRenderer.invoke("command:set-calculator-angle-unit", input),
-    stageSourceChange: (input) => ipcRenderer.invoke("command:stage-source-change", input),
-    writeSourceFile: (input) => ipcRenderer.invoke("command:write-source-file", input),
-    reloadSourceFile: (input) => ipcRenderer.invoke("command:reload-source-file", input),
-    desktopAction: (input: DesktopActionInput) => ipcRenderer.invoke("command:desktop-action", input),
+      invokeCommandWithRefresh("command:set-calculator-angle-unit", input),
+    stageSourceChange: (input) => invokeCommandWithRefresh("command:stage-source-change", input),
+    writeSourceFile: (input) => invokeCommandWithRefresh("command:write-source-file", input),
+    reloadSourceFile: (input) => invokeCommandWithRefresh("command:reload-source-file", input),
+    desktopAction: (input: DesktopActionInput) => invokeCommandWithRefresh("command:desktop-action", input),
     desktopRestore: (input: DesktopRestoreInput) =>
-      ipcRenderer.invoke("command:desktop-restore", input),
-    approveRequest: (input) => ipcRenderer.invoke("command:approve-request", input),
-    denyRequest: (input) => ipcRenderer.invoke("command:deny-request", input),
+      invokeCommandWithRefresh("command:desktop-restore", input),
+    approveRequest: (input) => invokeCommandWithRefresh("command:approve-request", input),
+    denyRequest: (input) => invokeCommandWithRefresh("command:deny-request", input),
     configureProviderProfile: (input: ConfigureProviderProfileInput) =>
-      ipcRenderer.invoke("command:configure-provider-profile", input),
+      invokeCommandWithRefresh("command:configure-provider-profile", input),
     useProviderProfile: (input: UseProviderProfileInput) =>
-      ipcRenderer.invoke("command:use-provider-profile", input),
+      invokeCommandWithRefresh("command:use-provider-profile", input),
     updateProviderRouting: (input: UpdateProviderRoutingInput) =>
-      ipcRenderer.invoke("command:update-provider-routing", input),
+      invokeCommandWithRefresh("command:update-provider-routing", input),
     configureMcpServer: (input: ConfigureMcpServerInput) =>
-      ipcRenderer.invoke("command:configure-mcp-server", input),
+      invokeCommandWithRefresh("command:configure-mcp-server", input),
     removeMcpServer: (input: RemoveMcpServerInput) =>
-      ipcRenderer.invoke("command:remove-mcp-server", input),
-    installQuicklispPackage: (input) => ipcRenderer.invoke("command:install-quicklisp-package", input),
-    runQlotCommand: (input) => ipcRenderer.invoke("command:run-qlot-command", input),
-    addSourceRegistryEntry: (input) => ipcRenderer.invoke("command:add-source-registry-entry", input),
-    updateSourceRegistryEntry: (input) => ipcRenderer.invoke("command:update-source-registry-entry", input),
-    removeSourceRegistryEntry: (input) => ipcRenderer.invoke("command:remove-source-registry-entry", input),
-    addLocalProject: (input) => ipcRenderer.invoke("command:add-local-project", input),
-    removeLocalProject: (input) => ipcRenderer.invoke("command:remove-local-project", input)
+      invokeCommandWithRefresh("command:remove-mcp-server", input),
+    installQuicklispPackage: (input) => invokeCommandWithRefresh("command:install-quicklisp-package", input),
+    runQlotCommand: (input) => invokeCommandWithRefresh("command:run-qlot-command", input),
+    addSourceRegistryEntry: (input) => invokeCommandWithRefresh("command:add-source-registry-entry", input),
+    updateSourceRegistryEntry: (input) => invokeCommandWithRefresh("command:update-source-registry-entry", input),
+    removeSourceRegistryEntry: (input) => invokeCommandWithRefresh("command:remove-source-registry-entry", input),
+    addLocalProject: (input) => invokeCommandWithRefresh("command:add-local-project", input),
+    removeLocalProject: (input) => invokeCommandWithRefresh("command:remove-local-project", input)
   },
   events: {
     subscribeEnvironmentEvents: async (
@@ -293,6 +414,13 @@ const api: SbclAgentDesktopApi = {
       pendingEvents.delete(handle.subscriptionId);
       return handle;
     },
+    subscribeRefreshEvents: async (
+      handler: (event: DesktopRefreshEventDto) => void
+    ): Promise<EventSubscriptionHandle> => {
+      const subscriptionId = `refresh-subscription-${nextRefreshSubscriptionId++}`;
+      refreshHandlers.set(subscriptionId, handler);
+      return { subscriptionId };
+    },
     subscribeConversationStream: async (
       handler: (event: EnvironmentEventDto) => void
     ): Promise<EventSubscriptionHandle> => {
@@ -303,6 +431,9 @@ const api: SbclAgentDesktopApi = {
     unsubscribe: async (subscriptionId: string): Promise<void> => {
       eventHandlers.delete(subscriptionId);
       pendingEvents.delete(subscriptionId);
+      if (refreshHandlers.delete(subscriptionId)) {
+        return;
+      }
       if (menuActionHandlers.delete(subscriptionId)) {
         return;
       }

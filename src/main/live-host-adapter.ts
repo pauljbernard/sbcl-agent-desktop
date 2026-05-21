@@ -1,8 +1,9 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { appendFile, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { basename, dirname, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type {
@@ -149,44 +150,50 @@ import type {
   WorkspaceId
 } from "../shared/contracts";
 import type { SbclAgentHostAdapter } from "./adapter-contract";
-import { PersistentSbclBridge, type LiveAdapterOptions, type RawServiceResponse } from "./live/bridge";
-import {
-  asRecord,
-  asRecordArray,
-  asStringArray,
-  camelizeKeys,
-  firstString,
-  mergeDesktopPreferences,
-  normalizeCommandResultLike,
-  normalizeDesktopPreferencesPayload,
-  normalizeMetadata
-} from "./live/adapter-support";
-import {
-  collectHostConsoleEntries,
-  collectHostDiagnosticReports,
-  diagnosticKindForPath,
-  diagnosticKindFromMetadata,
-  diagnosticPreviewMetadata,
-  diagnosticSummary,
-  processNameFromDiagnosticFile,
-  sampleHostDiskThroughputKbps,
-  sampleHostNetworkBytes,
-  sampleOpenConnectionCount,
-  sampleProcessUsage
-} from "./live/host-support";
-import { LiveConversationService } from "./live/conversation-service";
-import { LiveConfigurationService } from "./live/configuration-service";
-import { LiveDesktopPreferencesService } from "./live/desktop-preferences-service";
-import { LiveEnvironmentService } from "./live/environment-service";
-import { LiveHostUtilityService } from "./live/host-utility-service";
-import { LiveIncidentService } from "./live/incident-service";
-import { LiveRuntimeService } from "./live/runtime-service";
-import { LiveSourceService } from "./live/source-service";
-import { LiveWorkflowService } from "./live/workflow-service";
+
+interface LiveAdapterOptions {
+  transport: "socket" | "pipe";
+  endpoint: string;
+  projectDir: string;
+  bridgePath: string;
+  environmentStatePath: string;
+}
+
+interface RawServiceResponse<TData = unknown> {
+  contractVersion: number;
+  domain: string;
+  operation: string;
+  kind: "query" | "command";
+  status: "ok" | "error" | "awaiting-approval" | "rejected";
+  data: TData;
+  metadata: Record<string, unknown>;
+}
 
 interface StreamingBridgeFrame {
   type: "event" | "result";
   payload: unknown;
+}
+
+interface PersistentBridgeResponseFrame {
+  id: number;
+  response: unknown;
+}
+
+type BridgeRoute = "read" | "write";
+
+interface PersistentBridgePendingEntry {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  operation: string;
+  startedAt: number;
+}
+
+interface PersistentBridgeState {
+  process: ChildProcessWithoutNullStreams | null;
+  readline: ReturnType<typeof createInterface> | null;
+  requestId: number;
+  warmupRequested: boolean;
+  pending: Map<number, PersistentBridgePendingEntry>;
 }
 
 const DEFAULT_SBCL_PATH_CANDIDATES = [
@@ -341,12 +348,177 @@ const DEFAULT_LIVE_BINDING: BindingDto = {
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+function snakeToCamel(value: string): string {
+  return value.replace(/[-_]([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
+function camelizeKeys(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(camelizeKeys);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, nestedValue]) => [
+        snakeToCamel(key),
+        camelizeKeys(nestedValue)
+      ])
+    );
+  }
+
+  return value;
+}
+
+function normalizeMetadata(metadata: Record<string, unknown> | undefined): ServiceMetadataDto {
+  const normalizedMetadata = camelizeKeys(metadata ?? {}) as Record<string, unknown>;
+  const bindingValue = normalizedMetadata.binding;
+  const binding =
+    bindingValue && typeof bindingValue === "object"
+      ? {
+          sessionId: (bindingValue as Record<string, unknown>).sessionId as string | null | undefined,
+          environmentId:
+            ((bindingValue as Record<string, unknown>).environmentId as string | undefined) ?? "live-environment"
+        }
+      : null;
+
+  return {
+    authority: "environment",
+    binding,
+    readModel: normalizedMetadata.readModel as string | undefined,
+    commandModel: normalizedMetadata.commandModel as string | undefined,
+    policyId: (normalizedMetadata.policyId as string | null | undefined) ?? null,
+    threadId: (normalizedMetadata.threadId as string | null | undefined) ?? null,
+    turnId: (normalizedMetadata.turnId as string | null | undefined) ?? null,
+    workItemId: (normalizedMetadata.workItemId as string | null | undefined) ?? null,
+    workflowRecordId: (normalizedMetadata.workflowRecordId as string | null | undefined) ?? null,
+    incidentId: (normalizedMetadata.incidentId as string | null | undefined) ?? null,
+    runtimeId: (normalizedMetadata.runtimeId as string | null | undefined) ?? null,
+    eventFamily: (normalizedMetadata.eventFamily as string | null | undefined) ?? null,
+    visibility: (metadata?.visibility as string | null | undefined) ?? null
+  };
+}
+
 function bridgeRequestJson(request: Record<string, unknown> | undefined): string | null {
   if (!request) {
     return null;
   }
 
   return JSON.stringify(request);
+}
+
+function mergeDesktopPreferences(
+  current: DesktopPreferencesDto,
+  patch: Partial<DesktopPreferencesDto>
+): DesktopPreferencesDto {
+  const currentDesktopSurfaceView = current.desktopSurfaceView ?? {
+    tooltipScalePercent: 100,
+    controlIconScalePercent: 100,
+    dockIconScalePercent: 100,
+    conversationTextScalePercent: 100,
+    sourceCodeTextScalePercent: 100
+  };
+
+  return {
+    ...current,
+    ...patch,
+    desktopSurfaceView: {
+      tooltipScalePercent:
+        patch.desktopSurfaceView?.tooltipScalePercent ??
+        currentDesktopSurfaceView.tooltipScalePercent,
+      controlIconScalePercent:
+        patch.desktopSurfaceView?.controlIconScalePercent ??
+        currentDesktopSurfaceView.controlIconScalePercent,
+      dockIconScalePercent:
+        patch.desktopSurfaceView?.dockIconScalePercent ??
+        currentDesktopSurfaceView.dockIconScalePercent,
+      conversationTextScalePercent:
+        patch.desktopSurfaceView?.conversationTextScalePercent ??
+        currentDesktopSurfaceView.conversationTextScalePercent,
+      sourceCodeTextScalePercent:
+        patch.desktopSurfaceView?.sourceCodeTextScalePercent ??
+        currentDesktopSurfaceView.sourceCodeTextScalePercent
+    },
+    lispCodeView: {
+      ...current.lispCodeView,
+      ...patch.lispCodeView
+    }
+  };
+}
+
+function normalizeCommandResultLike<T>(
+  value: unknown
+): CommandResultDto<T> | null {
+  if (value === null || value === false || value === "null" || value === undefined) {
+    return null;
+  }
+
+  return value as CommandResultDto<T>;
+}
+
+function normalizeDesktopPreferencesPayload(
+  payload: Partial<DesktopPreferencesDto> | null | undefined
+): Partial<DesktopPreferencesDto> {
+  if (!payload) {
+    return {};
+  }
+
+  const normalized: Partial<DesktopPreferencesDto> = {
+    ...payload
+  };
+
+  if (payload.projects && typeof payload.projects === "object") {
+    normalized.projects = Array.isArray(payload.projects)
+      ? payload.projects
+      : Object.values(payload.projects).filter((project) => Boolean(project && typeof project === "object")) as ProjectProfileDto[];
+  }
+
+  if (payload.replSessionsByProject && typeof payload.replSessionsByProject === "object") {
+    normalized.replSessionsByProject = Object.fromEntries(
+      Object.entries(payload.replSessionsByProject).map(([projectId, sessions]) => [
+        projectId,
+        Array.isArray(sessions)
+          ? sessions.map((session) => ({
+              ...session,
+              history: Array.isArray(session.history) ? session.history : []
+            }))
+          : []
+      ])
+    );
+  }
+
+  if (payload.editorBuffersByProject && typeof payload.editorBuffersByProject === "object") {
+    normalized.editorBuffersByProject = Object.fromEntries(
+      Object.entries(payload.editorBuffersByProject).map(([projectId, buffers]) => [
+        projectId,
+        Array.isArray(buffers)
+          ? buffers.map((buffer) => ({
+              ...buffer,
+              result: normalizeCommandResultLike<RuntimeEvalResultDto>(buffer.result)
+            }))
+          : []
+      ])
+    );
+  }
+
+  if (payload.workspaceHistoryByProject && typeof payload.workspaceHistoryByProject === "object") {
+    normalized.workspaceHistoryByProject = Object.fromEntries(
+      Object.entries(payload.workspaceHistoryByProject).map(([projectId, history]) => [
+        projectId,
+        Array.isArray(history) ? history : []
+      ])
+    );
+  }
+
+  if (payload.workspaceResultByProject && typeof payload.workspaceResultByProject === "object") {
+    normalized.workspaceResultByProject = Object.fromEntries(
+      Object.entries(payload.workspaceResultByProject).map(([projectId, result]) => [
+        projectId,
+        normalizeCommandResultLike<RuntimeEvalResultDto>(result)
+      ])
+    );
+  }
+
+  return normalized;
 }
 
 function universalTimeToIso(value: unknown): string {
@@ -359,6 +531,28 @@ function universalTimeToIso(value: unknown): string {
   }
 
   return new Date().toISOString();
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((entry) => String(entry)) : [];
+}
+
+function asRecordArray(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.map((entry) => asRecord(entry)) : [];
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+
+  return undefined;
 }
 
 function normalizeWaitReason(waitReason: unknown): string | null {
@@ -1025,6 +1219,149 @@ function adaptMcpServerConfigDetailResponse(
   };
 }
 
+async function sampleProcessUsage(
+  pid: number | null | undefined
+): Promise<Partial<RuntimeTelemetryProcessDto>> {
+  if (!pid || !Number.isFinite(pid)) {
+    return {};
+  }
+
+  try {
+    const { stdout } = await execFileAsync("ps", [
+      "-p",
+      String(pid),
+      "-o",
+      "%cpu=,rss=,etime=,state=,command="
+    ]);
+    const line = stdout
+      .split("\n")
+      .map((entry) => entry.trim())
+      .find((entry) => entry.length > 0);
+    if (!line) {
+      return {};
+    }
+
+    const match = line.match(/^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/);
+    if (!match) {
+      return {};
+    }
+
+    return {
+      cpuPercent: Number.parseFloat(match[1]),
+      memoryMb: Number.parseFloat(match[2]) / 1024,
+      elapsed: match[3],
+      command: match[5]
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function sampleOpenConnectionCount(
+  pid: number | null | undefined
+): Promise<number | null> {
+  if (!pid || !Number.isFinite(pid)) {
+    return null;
+  }
+
+  try {
+    const { stdout } = await execFileAsync("lsof", ["-nP", "-a", "-p", String(pid), "-i"]);
+    const lines = stdout
+      .split("\n")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    return Math.max(0, lines.length - 1);
+  } catch {
+    return null;
+  }
+}
+
+async function sampleHostNetworkBytes(): Promise<{ inboundBytes: number; outboundBytes: number } | null> {
+  try {
+    const { stdout } = await execFileAsync("netstat", ["-ib"]);
+    const totals = stdout
+      .split("\n")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0 && !entry.startsWith("Name"))
+      .reduce(
+        (accumulator, line) => {
+          const columns = line.split(/\s+/);
+          if (columns.length < 10) {
+            return accumulator;
+          }
+
+          const name = columns[0];
+          if (!name || name.startsWith("lo")) {
+            return accumulator;
+          }
+
+          const inboundBytes = Number(columns[6]);
+          const outboundBytes = Number(columns[9]);
+          if (Number.isFinite(inboundBytes)) {
+            accumulator.inboundBytes += inboundBytes;
+          }
+          if (Number.isFinite(outboundBytes)) {
+            accumulator.outboundBytes += outboundBytes;
+          }
+          return accumulator;
+        },
+        { inboundBytes: 0, outboundBytes: 0 }
+      );
+
+    return totals.inboundBytes > 0 || totals.outboundBytes > 0 ? totals : null;
+  } catch {
+    return null;
+  }
+}
+
+async function sampleHostDiskThroughputKbps(): Promise<{ readKbps: number; writeKbps: number } | null> {
+  try {
+    const { stdout } = await execFileAsync("iostat", ["-d", "-K", "-w", "1", "-c", "2"]);
+    const lines = stdout
+      .split("\n")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    const dataLines = lines.filter((line) => !line.startsWith("disk") && !line.startsWith("cpu"));
+    if (dataLines.length === 0) {
+      return null;
+    }
+
+    const sampleLine = dataLines[dataLines.length - 1];
+    const columns = sampleLine.split(/\s+/);
+    if (columns.length < 3) {
+      return null;
+    }
+
+    let readKbps = 0;
+    let writeKbps = 0;
+    for (let index = 0; index + 2 < columns.length; index += 3) {
+      const kbPerTransfer = Number(columns[index]);
+      const transfersPerSecond = Number(columns[index + 1]);
+      const mbPerSecond = Number(columns[index + 2]);
+      if (!Number.isFinite(kbPerTransfer) || !Number.isFinite(transfersPerSecond)) {
+        continue;
+      }
+
+      const aggregateKbps =
+        Number.isFinite(mbPerSecond) && mbPerSecond > 0
+          ? mbPerSecond * 1024
+          : kbPerTransfer * transfersPerSecond;
+      readKbps += aggregateKbps / 2;
+      writeKbps += aggregateKbps / 2;
+    }
+
+    if (readKbps <= 0 && writeKbps <= 0) {
+      return null;
+    }
+
+    return {
+      readKbps: Number(readKbps.toFixed(1)),
+      writeKbps: Number(writeKbps.toFixed(1))
+    };
+  } catch {
+    return null;
+  }
+}
 
 function rawProcessStateToDtoState(value: string | undefined): RuntimeTelemetryProcessDto["state"] {
   switch (value) {
@@ -1433,6 +1770,8 @@ function adaptPackageBrowserResponse(
       availablePackages,
       nicknames: asStringArray(data.nicknames),
       useList,
+      externalSymbolCount: Number(data.externalSymbolCount ?? data.external_symbol_count ?? externalSymbols.length ?? 0),
+      internalSymbolCount: Number(data.internalSymbolCount ?? data.internal_symbol_count ?? internalSymbols.length ?? 0),
       externalSymbols: externalSymbols.map(adaptSymbol),
       internalSymbols: internalSymbols.map(adaptSymbol),
       summary: String(data.summary ?? "Package browser data projected from the live runtime.")
@@ -1461,9 +1800,13 @@ function adaptRuntimeSymbolPageResponse(
       }
       return "unknown" as const;
     })(),
-    visibility: (String(entry.visibility ?? "internal") === "external" ? "external" : "internal") as
-      | "external"
-      | "internal"
+    visibility: (() => {
+      const visibility = String(entry.visibility ?? "internal");
+      if (visibility === "external" || visibility === "internal" || visibility === "inherited") {
+        return visibility as "external" | "internal" | "inherited";
+      }
+      return "internal" as const;
+    })()
   }));
   return {
     contractVersion: response.contractVersion,
@@ -1640,6 +1983,257 @@ function consoleEntryFromEnvironmentEvent(
   };
 }
 
+function diagnosticKindForPath(path: string): DiagnosticReportKind {
+  if (path.endsWith(".crash")) {
+    return "crash";
+  }
+  if (path.endsWith(".spin")) {
+    return "spin";
+  }
+  if (path.endsWith(".log")) {
+    return "log";
+  }
+  return "diagnostic";
+}
+
+interface DiagnosticPreviewMetadata {
+  appName: string | null;
+  processName: string | null;
+  pid: number | null;
+  timestamp: string | null;
+  incidentId: string | null;
+  parentProc: string | null;
+  responsibleProc: string | null;
+  bugType: string | null;
+}
+
+function processNameFromDiagnosticFile(fileName: string): string | null {
+  const [processName] = fileName.split("_");
+  return processName && processName.length > 0 ? processName : null;
+}
+
+function diagnosticPreviewMetadata(content: string): DiagnosticPreviewMetadata {
+  const firstLine = content
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0) ?? "";
+
+  let header: Record<string, unknown> = {};
+  try {
+    header = firstLine.startsWith("{") ? asRecord(JSON.parse(firstLine)) : {};
+  } catch {
+    header = {};
+  }
+
+  const matchString = (pattern: RegExp): string | null => {
+    const match = pattern.exec(content);
+    return match?.[1] ?? null;
+  };
+
+  const matchNumber = (pattern: RegExp): number | null => {
+    const raw = matchString(pattern);
+    if (!raw) {
+      return null;
+    }
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? numeric : null;
+  };
+
+  return {
+    appName: firstString(header.app_name, header.name) ?? null,
+    processName: firstString(matchString(/"procName"\s*:\s*"([^"]+)"/), header.app_name, header.name) ?? null,
+    pid: matchNumber(/"pid"\s*:\s*(\d+)/),
+    timestamp: firstString(header.timestamp, matchString(/"captureTime"\s*:\s*"([^"]+)"/)) ?? null,
+    incidentId: firstString(header.incident_id, matchString(/"incident"\s*:\s*"([^"]+)"/)) ?? null,
+    parentProc: matchString(/"parentProc"\s*:\s*"([^"]+)"/),
+    responsibleProc: matchString(/"responsibleProc"\s*:\s*"([^"]+)"/),
+    bugType: firstString(header.bug_type, matchString(/"bug_type"\s*:\s*"([^"]+)"/)) ?? null
+  };
+}
+
+function diagnosticKindFromMetadata(path: string, preview: DiagnosticPreviewMetadata): DiagnosticReportKind {
+  if (path.endsWith(".ips")) {
+    return preview.incidentId || preview.bugType ? "crash" : "analytics";
+  }
+
+  return diagnosticKindForPath(path);
+}
+
+function diagnosticSummary(
+  kind: DiagnosticReportKind,
+  processName: string | null,
+  source: string,
+  preview?: DiagnosticPreviewMetadata | null
+): string {
+  const provenance =
+    preview?.parentProc || preview?.responsibleProc
+      ? ` Parent: ${preview?.parentProc ?? "unknown"}, responsible: ${preview?.responsibleProc ?? "unknown"}.`
+      : "";
+  switch (kind) {
+    case "crash":
+      return `${processName ?? "Process"} crash report retained from ${source}.${provenance}`;
+    case "spin":
+      return `${processName ?? "Process"} spin report retained from ${source}.${provenance}`;
+    case "analytics":
+      return `${processName ?? "Process"} analytics report retained from ${source}.${provenance}`;
+    case "log":
+      return `${processName ?? "Process"} log report retained from ${source}.${provenance}`;
+    default:
+      return `Retained host diagnostic report from ${source}.${provenance}`;
+  }
+}
+
+async function collectHostDiagnosticReports(limit = 40): Promise<DiagnosticReportSummaryDto[]> {
+  const roots = [
+    resolve(os.homedir(), "Library/Logs/DiagnosticReports"),
+    "/Library/Logs/DiagnosticReports"
+  ];
+  const entries: DiagnosticReportSummaryDto[] = [];
+
+  for (const root of roots) {
+    try {
+      const names = await readdir(root);
+      for (const name of names) {
+        const fullPath = resolve(root, name);
+        try {
+          const info = await stat(fullPath);
+          if (!info.isFile()) {
+            continue;
+          }
+          let preview: DiagnosticPreviewMetadata | null = null;
+          try {
+            preview = diagnosticPreviewMetadata((await readFile(fullPath, "utf8")).slice(0, 8192));
+          } catch {
+            preview = null;
+          }
+          const processName = preview?.processName ?? processNameFromDiagnosticFile(name);
+          const kind = diagnosticKindFromMetadata(name, preview ?? diagnosticPreviewMetadata(""));
+          entries.push({
+            reportId: fullPath,
+            kind,
+            title: name,
+            summary: diagnosticSummary(kind, processName, basename(root), preview),
+            source: basename(root),
+            processName,
+            pid: preview?.pid ?? null,
+            createdAt: preview?.timestamp ?? info.mtime.toISOString(),
+            path: fullPath
+          });
+        } catch {
+          continue;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return entries
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(0, limit);
+}
+
+function consoleTypeFromHostLogLevel(level: string | undefined): ConsoleLogEntryDto["type"] {
+  switch ((level ?? "").toLowerCase()) {
+    case "debug":
+      return "debug";
+    case "notice":
+      return "notice";
+    case "error":
+      return "error";
+    case "fault":
+      return "fault";
+    case "warning":
+      return "warning";
+    default:
+      return "info";
+  }
+}
+
+function parseHostLogJsonLines(stdout: string): Array<Record<string, unknown>> {
+  const trimmed = stdout.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed.map((entry) => asRecord(entry)) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  return trimmed
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .flatMap((line) => {
+      try {
+        return [asRecord(JSON.parse(line))];
+      } catch {
+        return [];
+      }
+    });
+}
+
+async function collectHostConsoleEntries(limit = 80): Promise<ConsoleLogEntryDto[]> {
+  try {
+    const predicate =
+      'process == "sbcl" OR process == "Electron" OR process CONTAINS "sbcl-agent" OR subsystem CONTAINS "electron"';
+    const { stdout } = await execFileAsync("log", [
+      "show",
+      "--style",
+      "json",
+      "--last",
+      "10m",
+      "--predicate",
+      predicate
+    ]);
+    const records = parseHostLogJsonLines(stdout);
+    return records
+      .map((record, index) => {
+        const processName =
+          firstString(record.process, record.processImagePath && basename(String(record.processImagePath))) ?? "host";
+        const source = firstString(record.subsystem, record.category, processName) ?? "host";
+        const message = firstString(record.eventMessage, record.message) ?? "Host console entry";
+        const timestamp = firstString(record.timestamp, record.date) ?? new Date().toISOString();
+        return {
+          entryId: `host:${index}:${timestamp}`,
+          cursor: index,
+          plane: "host" as const,
+          timestamp,
+          type: consoleTypeFromHostLogLevel(firstString(record.messageType, record.level)),
+          category: firstString(record.category, record.subsystem) ?? "host",
+          source,
+          message,
+          processName,
+          pid:
+            typeof record.processID === "number"
+              ? record.processID
+              : typeof record.pid === "number"
+                ? record.pid
+                : null,
+          threadId: firstString(record.threadID, record.threadIdentifier) ?? null,
+          activityId: firstString(record.activityIdentifier) ?? null,
+          environmentId: null,
+          runtimeId: null,
+          workItemId: null,
+          workflowRecordId: null,
+          incidentId: null,
+          threadRefId: null,
+          turnRefId: null,
+          visibility: "operator",
+          detail: JSON.stringify(record, null, 2)
+        };
+      })
+      .slice(-limit)
+      .reverse();
+  } catch {
+    return [];
+  }
+}
 
 function adaptStreamingEnvironmentEvent(payload: unknown): EnvironmentEventDto {
   const event = asRecord(payload);
@@ -3118,10 +3712,12 @@ function adaptEnvironmentBootstrapResponse(
         ...response,
         data: asRecord(data.status)
       }).data,
-      workspaceSummary: adaptWorkspaceSummaryResponse({
-        ...response,
-        data: asRecord(data.workspaceSummary)
-      }).data,
+      workspaceSummary: data.workspaceSummary
+        ? adaptWorkspaceSummaryResponse({
+            ...response,
+            data: asRecord(data.workspaceSummary)
+          }).data
+        : null,
       desktopModel: adaptDesktopModelResponse({
         ...response,
         data: asRecord(data.desktopModel)
@@ -3350,24 +3946,6 @@ function adaptSendConversationMessageResponse(
   };
 }
 
-function normalizedReferenceId(value: unknown, fallback: string): string {
-  if (typeof value === "string" || typeof value === "number") {
-    return String(value);
-  }
-  const record = asRecord(value);
-  const nested =
-    record.id ??
-    record.entityId ??
-    record.workItemId ??
-    record.operationId ??
-    record.approvalId ??
-    record.policyId;
-  if (typeof nested === "string" || typeof nested === "number") {
-    return String(nested);
-  }
-  return fallback;
-}
-
 function adaptTurnDetailResponse(
   response: RawServiceResponse<Record<string, unknown>>
 ): QueryResultDto<TurnDetailDto> {
@@ -3376,12 +3954,13 @@ function adaptTurnDetailResponse(
   const userMessage = asRecord(data.userMessage);
   const assistantMessage = asRecord(data.assistantMessage);
   const approvalSummary = asRecord(data.awaitingApproval);
-  const workItemId = detailSummary.workItemId
-    ? normalizedReferenceId(detailSummary.workItemId, "work-item")
-    : null;
-  const approvalIds = asRecordArray(approvalSummary.blockedOperations).map((operation) =>
-    normalizedReferenceId(operation.operationId ?? operation.approvalId ?? operation.policyId, "approval")
-  );
+  const workItemId = detailSummary.workItemId ? String(detailSummary.workItemId) : null;
+  const approvalIds = [
+    ...(workItemId && approvalSummary.awaitingApprovalP ? [workItemId] : []),
+    ...asRecordArray(approvalSummary.blockedOperations).map((operation) =>
+      String(operation.operationId ?? operation.policyId ?? "approval")
+    )
+  ];
   const recovery = asRecord(data.recovery);
   const incidents = asRecordArray(data.incidents);
   const artifacts = asRecordArray(data.artifacts);
@@ -3446,7 +4025,7 @@ function adaptTurnDetailResponse(
       workItemIds: [
         ...(workItemId ? [workItemId] : []),
         ...asRecordArray(recovery.resumableOperations).flatMap((operation) =>
-          operation.workItemId ? [normalizedReferenceId(operation.workItemId, "work-item")] : []
+          operation.workItemId ? [String(operation.workItemId)] : []
         )
       ],
       userMessage: adaptMessage(Object.keys(userMessage).length > 0 ? userMessage : null),
@@ -3496,6 +4075,22 @@ function adaptConversationLatencyResponse(
 
 export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
   private currentBinding: BindingDto | null = DEFAULT_LIVE_BINDING;
+  private bindingTransitionInFlight = false;
+  private focusedWorkspaceOverride: WorkspaceId | null = null;
+  private readonly readBridgeState: PersistentBridgeState = {
+    process: null,
+    readline: null,
+    requestId: 0,
+    warmupRequested: false,
+    pending: new Map()
+  };
+  private readonly writeBridgeState: PersistentBridgeState = {
+    process: null,
+    readline: null,
+    requestId: 0,
+    warmupRequested: false,
+    pending: new Map()
+  };
   private pendingEnvironmentBootstrapWarmup:
     | {
         environmentId: string;
@@ -3503,18 +4098,8 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
         promise: Promise<QueryResultDto<EnvironmentBootstrapDto>>;
       }
     | null = null;
-  private readonly persistentBridge: PersistentSbclBridge;
-  private readonly conversationService: LiveConversationService;
-  private readonly configurationService: LiveConfigurationService;
-  private readonly desktopPreferencesService: LiveDesktopPreferencesService;
-  private readonly environmentService: LiveEnvironmentService;
-  private readonly hostUtilityService: LiveHostUtilityService;
-  private readonly incidentService: LiveIncidentService;
-  private readonly runtimeService: LiveRuntimeService;
-  private readonly sourceService: LiveSourceService;
-  private readonly workflowService: LiveWorkflowService;
 
-  private readonly initialPreferences: DesktopPreferencesDto = {
+  private preferences: DesktopPreferencesDto = {
     lastWorkspace: "environment",
     sidebarPinned: true,
     sidebarWidth: null,
@@ -3563,163 +4148,34 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
       parenDepthColors: ["#6ec0c2", "#f4b267", "#9f8cff", "#7bc47f", "#f07c9b", "#56a3ff"]
     }
   };
+  private desktopPreferencesWriteQueue: Promise<DesktopPreferencesDto> = Promise.resolve(this.preferences);
 
   constructor(private readonly options: LiveAdapterOptions) {
-    this.persistentBridge = new PersistentSbclBridge({
-      options,
-      resolveSbclExecutable,
-      buildSbclSpawnEnvironment,
-      normalizeFrame: (value) => camelizeKeys(value) as { id: number; response: unknown }
-    });
-    this.environmentService = new LiveEnvironmentService({
-      invokeService: this.invokeService.bind(this),
-      getCurrentBinding: () => this.currentBinding,
-      getPendingEnvironmentBootstrapWarmup: () => this.pendingEnvironmentBootstrapWarmup,
-      adaptEnvironmentSummaryResponse,
-      adaptEnvironmentStatusResponse,
-      adaptWorkspaceSummaryResponse,
-      adaptDesktopModelResponse,
-      adaptEnvironmentBootstrapResponse,
-      adaptEventStreamResponse,
-      adaptTranscriptWorkspaceResponse,
-      adaptConsoleLogStreamResponse,
-      adaptArtifactListResponse,
-      adaptArtifactDetailResponse,
-      collectHostConsoleEntries
-    });
-    this.hostUtilityService = new LiveHostUtilityService({
-      options: this.options,
-      invokeService: this.invokeService.bind(this),
-      camelizeKeys: (value) => camelizeKeys(value),
-      normalizeMetadata,
-      getCurrentBinding: () => this.currentBinding,
-      setCurrentBinding: (binding) => {
-        this.currentBinding = binding;
-      },
-      clearPendingEnvironmentBootstrapWarmup: () => {
-        this.pendingEnvironmentBootstrapWarmup = null;
-      },
-      scheduleEnvironmentBootstrapWarmup: this.scheduleEnvironmentBootstrapWarmup.bind(this),
-      collectHostDiagnosticReports,
-      diagnosticKindForPath,
-      processNameFromDiagnosticFile,
-      diagnosticPreviewMetadata,
-      diagnosticKindFromMetadata,
-      diagnosticSummary,
-      adaptDesktopActionResponse,
-      adaptDesktopRestoreResponse
-    });
-    this.conversationService = new LiveConversationService({
-      invokeService: this.invokeService.bind(this),
-      invokeStreamingService: this.invokeStreamingService.bind(this),
-      camelizeKeys: (value) => camelizeKeys(value),
-      asRecord,
-      normalizeCommandStatus: (status) =>
-        normalizeCommandStatus(
-          status as "ok" | "rejected" | "error" | "awaiting-approval"
-        ),
-      normalizeMetadata,
-      adaptConversationWorkspaceResponse,
-      adaptThreadListResponse,
-      adaptThreadDetailResponse,
-      adaptTurnDetailResponse,
-      adaptConversationLatencyResponse,
-      adaptMemoryListResponse,
-      adaptCreateConversationThreadResponse,
-      adaptSendConversationMessageResponse
-    });
-    this.configurationService = new LiveConfigurationService({
-      invokeService: this.invokeService.bind(this),
-      camelizeKeys: (value) => camelizeKeys(value),
-      asRecord,
-      asRecordArray,
-      firstString,
-      normalizeCommandStatus: (status) =>
-        normalizeCommandStatus(
-          status as "ok" | "rejected" | "error" | "awaiting-approval"
-        ),
-      normalizeMetadata,
-      adaptProviderSummaryResponse,
-      adaptPackageManagementSummaryResponse,
-      adaptPackageManagementCommandResponse,
-      adaptDesktopTaskManifestListResponse,
-      adaptDesktopTaskRecordListResponse,
-      adaptMcpServerConfigListResponse,
-      adaptMcpServerConfigDetailResponse
-    });
-    this.desktopPreferencesService = new LiveDesktopPreferencesService({
-      invokeService: this.invokeService.bind(this),
-      getCurrentEnvironmentId: () => this.currentBinding?.environmentId,
-      mergeDesktopPreferences: (base, patch) => mergeDesktopPreferences(base, patch ?? {}),
-      normalizeDesktopPreferencesPayload: (value) =>
-        normalizeDesktopPreferencesPayload(
-          value as Partial<DesktopPreferencesDto> | null | undefined
-        ),
-      initialPreferences: this.initialPreferences
-    });
-    this.incidentService = new LiveIncidentService({
-      invokeService: this.invokeService.bind(this),
-      asStringArray,
-      camelizeKeys: (value) => camelizeKeys(value),
-      asRecord,
-      normalizeMetadata,
-      adaptApprovalListResponse,
-      adaptApprovalDetailResponse,
-      adaptIncidentListResponse,
-      adaptIncidentDetailResponse
-    });
-    this.runtimeService = new LiveRuntimeService({
-      invokeService: this.invokeService.bind(this),
-      camelizeKeys: (value) => camelizeKeys(value),
-      normalizeCommandStatus: (status) =>
-        normalizeCommandStatus(
-          status as "ok" | "rejected" | "error" | "awaiting-approval"
-        ),
-      normalizeMetadata,
-      adaptRuntimeSummaryResponse,
-      adaptRuntimeTelemetryResponse,
-      adaptRuntimeInspectionResponse,
-      adaptRuntimeEntityDetailResponse,
-      adaptPackageBrowserResponse,
-      adaptRuntimeSymbolPageResponse
-    });
-    this.sourceService = new LiveSourceService({
-      invokeService: this.invokeService.bind(this),
-      projectDir: this.options.projectDir,
-      getCurrentBinding: () => this.currentBinding,
-      camelizeKeys: (value) => camelizeKeys(value),
-      asStringArray,
-      normalizeCommandStatus: (status) =>
-        normalizeCommandStatus(
-          status as "ok" | "rejected" | "error" | "awaiting-approval"
-        ),
-      normalizeMetadata,
-      adaptRuntimeEvalResponse
-    });
-    this.workflowService = new LiveWorkflowService({
-      invokeService: this.invokeService.bind(this),
-      asRecord,
-      normalizeMetadata,
-      adaptIntentDetail,
-      adaptCreateProjectResponse,
-      adaptWorkItemDetailCommandResponse,
-      adaptProjectListResponse,
-      adaptProjectTestingHarness,
-      adaptProjectDetailResponse,
-      adaptWorkItemListResponse,
-      adaptWorkItemDetailResponse,
-      adaptWorkItemPlanResponse,
-      adaptWorkflowRecordDetailResponse
-    });
     this.schedulePersistentBridgeWarmup();
   }
 
   private schedulePersistentBridgeWarmup(): void {
-    if (this.options.transport !== "pipe" || this.persistentBridge.warmupRequested) {
+    if (this.options.transport !== "pipe" || this.readBridgeState.warmupRequested) {
       return;
     }
-    this.persistentBridge.warmup();
-    this.scheduleEnvironmentBootstrapWarmup();
+    this.readBridgeState.warmupRequested = true;
+    const startedAt = performance.now();
+    try {
+      void this.ensurePersistentBridgeForRoute("read");
+      console.info(
+        "[bridge-perf] operation=%s durationMs=%d status=warmup-requested transport=persistent-pipe",
+        "persistent-bridge",
+        Math.round(performance.now() - startedAt)
+      );
+    } catch (error) {
+      this.readBridgeState.warmupRequested = false;
+      console.info(
+        "[bridge-perf] operation=%s durationMs=%d status=warmup-error transport=persistent-pipe",
+        "persistent-bridge",
+        Math.round(performance.now() - startedAt)
+      );
+      throw error;
+    }
   }
 
   private scheduleEnvironmentBootstrapWarmup(): void {
@@ -3761,6 +4217,206 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     });
   }
 
+  private bridgeState(route: BridgeRoute): PersistentBridgeState {
+    return route === "read" ? this.readBridgeState : this.writeBridgeState;
+  }
+
+  private bridgeRouteForOperation(operation: string): BridgeRoute {
+    const readOnlyOperations = new Set([
+      "environment.bootstrap",
+      "environment.image-registry",
+      "environment.status",
+      "environment.summary",
+      "workspace.summary",
+      "desktop.show",
+      "desktop.preferences.get",
+      "events.stream",
+      "transcript.workspace",
+      "console.stream",
+      "diagnostic.list",
+      "diagnostic.detail",
+      "artifact.list",
+      "artifact.detail",
+      "conversation.workspace",
+      "conversation.thread-list",
+      "conversation.thread-detail",
+      "conversation.turn-detail",
+      "conversation.latency",
+      "memory.list",
+      "memory.detail",
+      "runtime.summary",
+      "runtime.telemetry",
+      "runtime.inspect-symbol",
+      "runtime.entity-detail",
+      "runtime.package-browser",
+      "runtime.symbol-page",
+      "filesystem.directory",
+      "source.preview",
+      "approval.list",
+      "approval.detail",
+      "incident.list",
+      "incident.detail",
+      "work-item.list",
+      "work-item.detail",
+      "work-item.plan",
+      "workflow.record-detail",
+      "environment.provider.get",
+      "package-management.summary",
+      "desktop-task.manifests",
+      "desktop-task.records",
+      "desktop-task.pending-approval",
+      "desktop-task.actor-flow",
+      "desktop-task.actor-system-panel",
+      "desktop-task.actor-trace",
+      "desktop-task.dlq",
+      "desktop-task.mcp-servers",
+      "desktop-task.mcp-server",
+      "calculator.summary",
+      "project.list",
+      "project.detail",
+      "project.testing-harness-inventory"
+    ]);
+    return readOnlyOperations.has(operation) ? "read" : "write";
+  }
+
+  private invalidateReadBridge(reason: string): void {
+    this.invalidateBridge("read", reason);
+  }
+
+  private shouldInvalidateReadBridgeAfterWrite(operation: string): boolean {
+    const nonInvalidatingWrites = new Set([
+      "desktop.preferences.set"
+    ]);
+    return !nonInvalidatingWrites.has(operation);
+  }
+
+  private invalidateBridge(route: BridgeRoute, reason: string): void {
+    if (route === "read") {
+      this.pendingEnvironmentBootstrapWarmup = null;
+    }
+    const state = this.bridgeState(route);
+    const child = state.process;
+    state.process = null;
+    state.warmupRequested = false;
+    state.readline?.close();
+    state.readline = null;
+    for (const entry of state.pending.values()) {
+      entry.reject(new Error(`${route} bridge invalidated while ${entry.operation} was pending (${reason}).`));
+    }
+    state.pending.clear();
+    if (child && !child.killed) {
+      try {
+        child.kill();
+      } catch {
+        // Ignore shutdown errors while invalidating the read bridge.
+      }
+    }
+  }
+
+  private async ensurePersistentBridgeForRoute(
+    route: BridgeRoute
+  ): Promise<ChildProcessWithoutNullStreams> {
+    const state = this.bridgeState(route);
+    if (state.process && !state.process.killed) {
+      return state.process;
+    }
+
+    const executable = resolveSbclExecutable();
+    const cwd = existsSync(this.options.projectDir) ? this.options.projectDir : os.homedir();
+    const env = buildSbclSpawnEnvironment();
+    const child = spawn(
+      executable,
+      [
+        "--script",
+        this.options.bridgePath,
+        this.options.projectDir,
+        this.options.environmentStatePath,
+        "--serve"
+      ],
+      {
+        cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"]
+      }
+    );
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => {
+      if (state.process !== child) {
+        return;
+      }
+      const pending = Array.from(state.pending.values());
+      state.pending.clear();
+      state.process = null;
+      state.warmupRequested = false;
+      state.readline?.close();
+      state.readline = null;
+      for (const entry of pending) {
+        entry.reject(error);
+      }
+    });
+    child.on("close", (code) => {
+      if (state.process !== child) {
+        return;
+      }
+      const pending = Array.from(state.pending.values());
+      state.pending.clear();
+      state.process = null;
+      state.warmupRequested = false;
+      state.readline?.close();
+      state.readline = null;
+      for (const entry of pending) {
+        console.info(
+          "[bridge-perf] operation=%s durationMs=%d status=%s-bridge-closed code=%s stderrBytes=%d",
+          entry.operation,
+          Math.round(performance.now() - entry.startedAt),
+          route,
+          String(code ?? "unknown"),
+          stderr.length
+        );
+        entry.reject(
+          new Error(
+            stderr.trim() || `Persistent bridge exited before returning a result (exit code ${code ?? "unknown"}).`
+          )
+        );
+      }
+    });
+
+    const stdoutLines = createInterface({ input: child.stdout });
+    stdoutLines.on("line", (line) => {
+      if (state.process !== child) {
+        return;
+      }
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return;
+      }
+      let frame: PersistentBridgeResponseFrame;
+      try {
+        frame = camelizeKeys(JSON.parse(trimmed)) as PersistentBridgeResponseFrame;
+      } catch (error) {
+        const pending = Array.from(state.pending.values());
+        state.pending.clear();
+        for (const entry of pending) {
+          entry.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+        return;
+      }
+      const pending = state.pending.get(frame.id);
+      if (!pending) {
+        return;
+      }
+      state.pending.delete(frame.id);
+      pending.resolve(frame.response);
+    });
+
+    state.process = child;
+    state.readline = stdoutLines;
+    return child;
+  }
+
   async getHostStatus(): Promise<HostStatusDto> {
     return {
       hostState: "ready",
@@ -3776,52 +4432,199 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
   }
 
   async setEnvironmentBinding(environmentId: string): Promise<CommandResultDto<BindingDto>> {
-    return this.hostUtilityService.setEnvironmentBinding(environmentId);
+    const nextBinding: BindingDto = {
+      environmentId,
+      sessionId: "desktop-session-live"
+    };
+
+    this.currentBinding = nextBinding;
+    this.pendingEnvironmentBootstrapWarmup = null;
+    this.invalidateBridge("read", "environment-binding-changed");
+    this.invalidateBridge("write", "environment-binding-changed");
+
+    return {
+      contractVersion: 1,
+      domain: "host",
+      operation: "host.set_environment_binding",
+      kind: "command",
+      status: "ok",
+      data: nextBinding,
+      metadata: {
+        authority: "environment",
+        binding: nextBinding
+      }
+    };
   }
 
   async getEnvironmentImageRegistry(): Promise<QueryResultDto<EnvironmentImageRegistryDto>> {
-    return this.hostUtilityService.getEnvironmentImageRegistry();
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.image-registry",
+      undefined
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "environment",
+      operation: "environment.image-registry",
+      kind: "query",
+      status: response.status === "error" ? "error" : "ok",
+      data: response.data as unknown as EnvironmentImageRegistryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async loadEnvironmentImage(imageIdOrName: string): Promise<CommandResultDto<BindingDto>> {
-    return this.hostUtilityService.loadEnvironmentImage(imageIdOrName);
+    this.bindingTransitionInFlight = true;
+    try {
+      const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+        "environment.load-image",
+        this.currentBinding?.environmentId,
+        { imageIdOrName }
+      );
+      const summary = response.data.summary as Record<string, unknown> | undefined;
+      const normalizedMetadata = camelizeKeys(response.metadata ?? {}) as Record<string, unknown>;
+      const bindingRecord =
+        normalizedMetadata.binding && typeof normalizedMetadata.binding === "object"
+          ? (normalizedMetadata.binding as Record<string, unknown>)
+          : null;
+      const environmentId =
+        (bindingRecord?.environmentId as string | undefined) ??
+        (summary?.id as string | undefined) ??
+        (normalizedMetadata.environmentId as string | undefined) ??
+        this.currentBinding?.environmentId ??
+        DEFAULT_LIVE_BINDING.environmentId;
+      const binding: BindingDto = {
+        environmentId,
+        sessionId: this.currentBinding?.sessionId ?? DEFAULT_LIVE_BINDING.sessionId
+      };
+      this.currentBinding = binding;
+      this.pendingEnvironmentBootstrapWarmup = null;
+      this.invalidateBridge("read", "environment-image-loaded");
+      this.invalidateBridge("write", "environment-image-loaded");
+      return {
+        contractVersion: response.contractVersion,
+        domain: "host",
+        operation: "host.load_environment_image",
+        kind: "command",
+        status: response.status === "error" ? "error" : "ok",
+        data: binding,
+        metadata: normalizeMetadata(response.metadata)
+      };
+    } finally {
+      this.bindingTransitionInFlight = false;
+    }
   }
 
   async saveEnvironmentImage(input: {
     name: string;
     overwrite?: boolean;
   }): Promise<CommandResultDto<EnvironmentImageRecordDto>> {
-    return this.hostUtilityService.saveEnvironmentImage(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.save-image",
+      this.currentBinding?.environmentId,
+      { imageName: input.name, overwrite: Boolean(input.overwrite) }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "host",
+      operation: "host.save_environment_image",
+      kind: "command",
+      status: response.status === "error" ? "error" : "ok",
+      data: response.data.image as EnvironmentImageRecordDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async revertEnvironmentToImage(): Promise<CommandResultDto<BindingDto>> {
-    return this.hostUtilityService.revertEnvironmentToImage();
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.revert-image",
+      this.currentBinding?.environmentId
+    );
+    const summary = response.data.summary as Record<string, unknown> | undefined;
+    const binding: BindingDto = {
+      environmentId:
+        (summary?.id as string | undefined) ??
+        this.currentBinding?.environmentId ??
+        DEFAULT_LIVE_BINDING.environmentId,
+      sessionId: this.currentBinding?.sessionId ?? DEFAULT_LIVE_BINDING.sessionId
+    };
+    this.currentBinding = binding;
+    this.pendingEnvironmentBootstrapWarmup = null;
+    this.invalidateBridge("read", "environment-image-reverted");
+    this.invalidateBridge("write", "environment-image-reverted");
+    return {
+      contractVersion: response.contractVersion,
+      domain: "host",
+      operation: "host.revert_environment_image",
+      kind: "command",
+      status: response.status === "error" ? "error" : "ok",
+      data: binding,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async environmentSummary(environmentId?: string): Promise<QueryResultDto<EnvironmentSummaryDto>> {
-    return this.environmentService.environmentSummary(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.summary",
+      environmentId
+    );
+    return adaptEnvironmentSummaryResponse(response);
   }
 
   async environmentStatus(environmentId?: string): Promise<QueryResultDto<EnvironmentStatusDto>> {
-    return this.environmentService.environmentStatus(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.status",
+      environmentId
+    );
+    return adaptEnvironmentStatusResponse(response);
   }
 
   async workspaceSummary(environmentId?: string): Promise<QueryResultDto<WorkspaceSummaryDto>> {
-    return this.environmentService.workspaceSummary(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "workspace.summary",
+      environmentId
+    );
+    return adaptWorkspaceSummaryResponse(response);
   }
 
   async desktopModel(environmentId?: string): Promise<QueryResultDto<DesktopModelDto>> {
-    return this.environmentService.desktopModel(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop.show",
+      environmentId
+    );
+    return adaptDesktopModelResponse(response);
   }
 
   async environmentBootstrap(environmentId?: string): Promise<QueryResultDto<EnvironmentBootstrapDto>> {
-    return this.environmentService.environmentBootstrap(environmentId);
+    const requestedEnvironmentId = environmentId ?? this.currentBinding?.environmentId;
+    if (
+      requestedEnvironmentId &&
+      this.pendingEnvironmentBootstrapWarmup &&
+      this.pendingEnvironmentBootstrapWarmup.environmentId === requestedEnvironmentId &&
+      performance.now() - this.pendingEnvironmentBootstrapWarmup.startedAt <= 5000
+    ) {
+      return this.pendingEnvironmentBootstrapWarmup.promise;
+    }
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.bootstrap",
+      environmentId
+    );
+    return adaptEnvironmentBootstrapResponse(response);
   }
 
   async environmentEvents(
     input: EventSubscriptionInput
   ): Promise<QueryResultDto<EnvironmentEventDto[]>> {
-    return this.environmentService.environmentEvents(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "events.stream",
+      input.environmentId,
+      {
+        afterCursor: input.fromCursor,
+        family: input.families?.[0],
+        visibility: input.visibility?.[0],
+        limit: input.limit ?? 50
+      }
+    );
+    return adaptEventStreamResponse(response);
   }
 
   async transcriptWorkspace(input: {
@@ -3833,37 +4636,182 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     includeEnvironmentConsole?: boolean;
     consoleLimit?: number;
   }): Promise<QueryResultDto<TranscriptWorkspaceDto>> {
-    return this.environmentService.transcriptWorkspace(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "transcript.workspace",
+      input.environmentId,
+      {
+        family: input.families?.[0],
+        visibility: input.visibility?.[0],
+        eventLimit: input.eventLimit,
+        includeEvents: input.includeEvents !== false,
+        includeEnvironmentConsole: input.includeEnvironmentConsole !== false,
+        consoleLimit: input.consoleLimit
+      }
+    );
+    return adaptTranscriptWorkspaceResponse(response);
   }
 
   async consoleLogStream(
     input: ConsoleLogQueryInput
   ): Promise<QueryResultDto<ConsoleLogStreamDto>> {
-    return this.environmentService.consoleLogStream(input);
+    if ((input.plane ?? "environment") === "host") {
+      const entries = await collectHostConsoleEntries(input.limit ?? 80);
+      const typeFilter = input.types?.length ? new Set(input.types) : null;
+      const sourceFilter = input.sources?.length ? new Set(input.sources) : null;
+      const filtered = entries.filter((entry) => {
+        if (typeFilter && !typeFilter.has(entry.type)) {
+          return false;
+        }
+        if (sourceFilter && !sourceFilter.has(entry.source)) {
+          return false;
+        }
+        return true;
+      });
+      return {
+        contractVersion: 1,
+        domain: "console",
+        operation: "console.stream",
+        kind: "query",
+        status: "ok",
+        data: {
+          plane: "host",
+          entries: filtered,
+          nextCursor: filtered[filtered.length - 1]?.cursor ?? null,
+          summary:
+            filtered.length > 0
+              ? `Projected ${filtered.length} host console entries from recent macOS log history.`
+              : "No recent host console entries matched the current host-console filter."
+        },
+        metadata: {
+          authority: "environment",
+          binding: this.currentBinding,
+          readModel: "host-console-stream-v1"
+        }
+      };
+    }
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "console.stream",
+      input.environmentId,
+      {
+        afterCursor: input.fromCursor,
+        limit: input.limit ?? 50,
+        type: input.types?.[0],
+        source: input.sources?.[0]
+      }
+    );
+    return adaptConsoleLogStreamResponse(response);
   }
 
   async diagnosticReportList(
     environmentId?: string
   ): Promise<QueryResultDto<DiagnosticReportSummaryDto[]>> {
-    return this.hostUtilityService.diagnosticReportList(environmentId);
+    const reports = await collectHostDiagnosticReports();
+    return {
+      contractVersion: 1,
+      domain: "diagnostic",
+      operation: "diagnostic.report_list",
+      kind: "query",
+      status: "ok",
+      data: reports,
+      metadata: {
+        authority: "environment",
+        binding: {
+          environmentId: environmentId ?? this.currentBinding?.environmentId ?? "live-environment",
+          sessionId: this.currentBinding?.sessionId ?? null
+        },
+        readModel: "host-diagnostic-report-list-v1"
+      }
+    };
   }
 
   async diagnosticReportDetail(
     reportId: string,
     environmentId?: string
   ): Promise<QueryResultDto<DiagnosticReportDetailDto>> {
-    return this.hostUtilityService.diagnosticReportDetail(reportId, environmentId);
+    let contentPreview: string | null = null;
+    let byteSize: number | null = null;
+    try {
+      const info = await stat(reportId);
+      byteSize = info.size;
+      contentPreview = (await readFile(reportId, "utf8")).slice(0, 12000);
+    } catch {
+      contentPreview = null;
+    }
+    const summary =
+      (await this.diagnosticReportList(environmentId)).data.find((report) => report.reportId === reportId) ?? {
+        reportId,
+        kind: diagnosticKindForPath(reportId),
+        title: basename(reportId),
+        summary: diagnosticSummary(diagnosticKindForPath(reportId), processNameFromDiagnosticFile(basename(reportId)), basename(dirname(reportId))),
+        source: basename(dirname(reportId)),
+        processName: processNameFromDiagnosticFile(basename(reportId)),
+        pid: null,
+        createdAt: new Date().toISOString(),
+        path: reportId
+      };
+    const preview = contentPreview ? diagnosticPreviewMetadata(contentPreview) : null;
+    const resolvedKind = diagnosticKindFromMetadata(reportId, preview ?? diagnosticPreviewMetadata(""));
+    return {
+      contractVersion: 1,
+      domain: "diagnostic",
+      operation: "diagnostic.report_detail",
+      kind: "query",
+      status: "ok",
+      data: {
+        ...summary,
+        kind: resolvedKind,
+        processName: preview?.processName ?? summary.processName ?? null,
+        pid: preview?.pid ?? summary.pid ?? null,
+        createdAt: preview?.timestamp ?? summary.createdAt,
+        summary: diagnosticSummary(
+          resolvedKind,
+          preview?.processName ?? summary.processName ?? null,
+          summary.source,
+          preview
+        ),
+        contentPreview,
+        metadata: {
+          authority: "host",
+          bytesPreviewed: contentPreview?.length ?? 0,
+          byteSize,
+          extension: reportId.split(".").pop() ?? null,
+          rootCategory: basename(dirname(reportId)),
+          incidentId: preview?.incidentId ?? null,
+          parentProc: preview?.parentProc ?? null,
+          responsibleProc: preview?.responsibleProc ?? null,
+          bugType: preview?.bugType ?? null,
+          appName: preview?.appName ?? null
+        }
+      },
+      metadata: {
+        authority: "environment",
+        binding: {
+          environmentId: environmentId ?? this.currentBinding?.environmentId ?? "live-environment",
+          sessionId: this.currentBinding?.sessionId ?? null
+        },
+        readModel: "host-diagnostic-report-detail-v1"
+      }
+    };
   }
 
   async artifactList(environmentId?: string): Promise<QueryResultDto<ArtifactSummaryDto[]>> {
-    return this.environmentService.artifactList(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "artifact.list",
+      environmentId
+    );
+    return adaptArtifactListResponse(response);
   }
 
   async artifactDetail(
     artifactId: string,
     environmentId?: string
   ): Promise<QueryResultDto<ArtifactDetailDto>> {
-    return this.environmentService.artifactDetail(artifactId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "artifact.detail",
+      environmentId,
+      { artifactId }
+    );
+    return adaptArtifactDetailResponse(response);
   }
 
   async conversationWorkspace(input: {
@@ -3871,68 +4819,185 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     threadId?: string | null;
     turnId?: string | null;
   }): Promise<QueryResultDto<ConversationWorkspaceDto>> {
-    return this.conversationService.conversationWorkspace(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "conversation.workspace",
+      input.environmentId,
+      input.threadId || input.turnId
+        ? {
+            ...(input.threadId ? { threadId: input.threadId } : {}),
+            ...(input.turnId ? { turnId: input.turnId } : {})
+          }
+        : undefined
+    );
+    return adaptConversationWorkspaceResponse(response);
   }
 
   async threadList(environmentId?: string): Promise<QueryResultDto<ThreadSummaryDto[]>> {
-    return this.conversationService.threadList(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "conversation.thread-list",
+      environmentId
+    );
+    console.info(
+      "[conversation-thread-list-raw] env=%s count=%d type=%s sample=%s payload=%s",
+      environmentId ?? this.currentBinding?.environmentId ?? "none",
+      Array.isArray(response.data) ? response.data.length : -1,
+      Array.isArray(response.data)
+        ? "array"
+        : response.data == null
+          ? "null"
+          : typeof response.data,
+      Array.isArray(response.data) && response.data.length > 0 ? JSON.stringify(response.data[0]) : "none",
+      JSON.stringify(response.data)
+    );
+    return adaptThreadListResponse(response);
   }
 
   async threadDetail(
     threadId: string,
     environmentId?: string
   ): Promise<QueryResultDto<ThreadDetailDto>> {
-    return this.conversationService.threadDetail(threadId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "conversation.thread-detail",
+      environmentId,
+      { threadId }
+    );
+    return adaptThreadDetailResponse(response);
   }
 
   async turnDetail(turnId: string, environmentId?: string): Promise<QueryResultDto<TurnDetailDto>> {
-    return this.conversationService.turnDetail(turnId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "conversation.turn-detail",
+      environmentId,
+      { turnId }
+    );
+    return adaptTurnDetailResponse(response);
   }
 
   async conversationLatency(
     turnId: string,
     environmentId?: string
   ): Promise<QueryResultDto<ConversationLatencySummaryDto>> {
-    return this.conversationService.conversationLatency(turnId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "conversation.latency",
+      environmentId,
+      { turnId }
+    );
+    return adaptConversationLatencyResponse(response);
   }
 
   async memoryList(environmentId?: string): Promise<QueryResultDto<MemoryListDto>> {
-    return this.conversationService.memoryList(environmentId);
+    const response = await this.invokeService<
+      RawServiceResponse<Record<string, unknown> | Array<Record<string, unknown>>>
+    >(
+      "memory.list",
+      environmentId
+    );
+    return adaptMemoryListResponse(response);
   }
 
   async memoryDetail(memoryId: string, environmentId?: string): Promise<QueryResultDto<MemoryEntryDto>> {
-    return this.conversationService.memoryDetail(memoryId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "memory.detail",
+      environmentId,
+      { memoryId }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "memory",
+      operation: response.operation,
+      kind: "query",
+      status: "ok",
+      data: camelizeKeys(response.data) as MemoryEntryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async createConversationThread(
     input: CreateConversationThreadInput
   ): Promise<CommandResultDto<ThreadSummaryDto>> {
-    return this.conversationService.createConversationThread(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "conversation.create-thread",
+      input.environmentId,
+      {
+        title: input.title,
+        summary: input.summary
+      }
+    );
+    return adaptCreateConversationThreadResponse(response);
   }
 
   async updateConversationThread(
     input: UpdateConversationThreadInput
   ): Promise<CommandResultDto<ThreadSummaryDto>> {
-    return this.conversationService.updateConversationThread(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "conversation.update-thread",
+      input.environmentId,
+      {
+        threadId: input.threadId,
+        title: input.title,
+        summary: input.summary
+      }
+    );
+    return adaptCreateConversationThreadResponse(response);
   }
 
   async sendConversationMessage(
     input: SendConversationMessageInput,
     onEvent?: (event: EnvironmentEventDto) => void
   ): Promise<CommandResultDto<SendConversationMessageResultDto>> {
-    return this.conversationService.sendConversationMessage(input, onEvent);
+    const response = await this.invokeStreamingService<RawServiceResponse<Record<string, unknown>>>(
+      "conversation.send-message-stream",
+      input.environmentId,
+      {
+        threadId: input.threadId,
+        prompt: input.prompt,
+        attachments: input.attachments ?? [],
+        surfaceContext: input.surfaceContext ?? null,
+        surfaceActions: input.surfaceActions ?? []
+      },
+      onEvent
+    );
+    return adaptSendConversationMessageResponse(response);
   }
 
   async approveActorMessage(
     input: { environmentId: string; actorMessageId: string }
   ): Promise<CommandResultDto<SendConversationMessageResultDto>> {
-    return this.conversationService.approveActorMessage(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop-task.approve-message",
+      input.environmentId,
+      { actorMessageId: input.actorMessageId }
+    );
+    return adaptSendConversationMessageResponse(response);
   }
 
   async approveApproval(
     input: { environmentId: string; approvalId: string; sessionId?: string | null }
   ): Promise<CommandResultDto<SendConversationMessageResultDto>> {
-    return this.conversationService.approveApproval(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop-task.approve-approval",
+      input.environmentId,
+      { approvalId: input.approvalId, sessionId: input.sessionId ?? null }
+    );
+    if (response.status === "error" || response.status === "rejected") {
+      console.error(
+        "[live-host-adapter] approveApproval failed approvalId=%s sessionId=%s status=%s data=%o metadata=%o",
+        input.approvalId,
+        input.sessionId ?? null,
+        response.status,
+        response.data,
+        response.metadata
+      );
+    } else {
+      console.info(
+        "[live-host-adapter] approveApproval approvalId=%s sessionId=%s status=%s dataKeys=%o",
+        input.approvalId,
+        input.sessionId ?? null,
+        response.status,
+        Object.keys(asRecord(response.data))
+      );
+    }
+    return adaptSendConversationMessageResponse(response);
   }
 
   async updateMemory(input: {
@@ -3944,14 +5009,47 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     summary?: string;
     confidence?: number | null;
   }): Promise<CommandResultDto<MemoryEntryDto>> {
-    return this.conversationService.updateMemory(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "memory.update",
+      input.environmentId,
+      {
+        memoryId: input.memoryId,
+        category: input.category,
+        attribute: input.attribute,
+        value: input.value,
+        summary: input.summary,
+        confidence: input.confidence
+      }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "memory",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as MemoryEntryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async deleteMemory(input: {
     environmentId: string;
     memoryId: string;
   }): Promise<CommandResultDto<MemoryDeleteResultDto>> {
-    return this.conversationService.deleteMemory(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "memory.delete",
+      input.environmentId,
+      { memoryId: input.memoryId }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "memory",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as MemoryDeleteResultDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async extractConversationAttachmentText(input: {
@@ -3981,50 +5079,172 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
   }
 
   async runtimeSummary(environmentId?: string): Promise<QueryResultDto<RuntimeSummaryDto>> {
-    return this.runtimeService.runtimeSummary(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "runtime.summary",
+      environmentId
+    );
+    return adaptRuntimeSummaryResponse(response);
   }
 
   async calculatorSummary(environmentId?: string): Promise<QueryResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.calculatorSummary(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.summary",
+      environmentId
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "query",
+      status: response.status === "error" ? "error" : "ok",
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
 
   async setCalculatorExpression(input: { environmentId: string; expression: string }): Promise<CommandResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.setCalculatorExpression(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.set-expression",
+      input.environmentId,
+      { expression: input.expression }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async appendCalculatorToken(input: { environmentId: string; token: string }): Promise<CommandResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.appendCalculatorToken(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.append-token",
+      input.environmentId,
+      { token: input.token }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async backspaceCalculator(environmentId: string): Promise<CommandResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.backspaceCalculator(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.backspace",
+      environmentId
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async clearCalculator(environmentId: string): Promise<CommandResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.clearCalculator(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.clear",
+      environmentId
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async setCalculatorMode(input: { environmentId: string; mode: string }): Promise<CommandResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.setCalculatorMode(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.set-mode",
+      input.environmentId,
+      { mode: input.mode }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async setCalculatorBase(input: { environmentId: string; base: number }): Promise<CommandResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.setCalculatorBase(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.set-base",
+      input.environmentId,
+      { base: input.base }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async setCalculatorWordSize(input: { environmentId: string; wordSize: number }): Promise<CommandResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.setCalculatorWordSize(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.set-word-size",
+      input.environmentId,
+      { wordSize: input.wordSize }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async setCalculatorAngleUnit(input: { environmentId: string; angleUnit: string }): Promise<CommandResultDto<CalculatorSummaryDto>> {
-    return this.runtimeService.setCalculatorAngleUnit(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.set-angle-unit",
+      input.environmentId,
+      { angleUnit: input.angleUnit }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorSummaryDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async runtimeTelemetrySnapshot(
     environmentId?: string
   ): Promise<QueryResultDto<RuntimeTelemetrySnapshotDto>> {
-    return this.runtimeService.runtimeTelemetrySnapshot(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "runtime.telemetry",
+      environmentId
+    );
+    return adaptRuntimeTelemetryResponse(response);
   }
 
   async runtimeInspectSymbol(input: {
@@ -4033,7 +5253,16 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     packageName?: string;
     mode: "describe" | "definitions" | "callers" | "methods" | "divergence";
   }): Promise<QueryResultDto<RuntimeInspectionResultDto>> {
-    return this.runtimeService.runtimeInspectSymbol(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "runtime.inspect-symbol",
+      input.environmentId,
+      {
+        symbol: input.symbol,
+        packageName: input.packageName,
+        mode: input.mode
+      }
+    );
+    return adaptRuntimeInspectionResponse(response, input);
   }
 
   async runtimeEntityDetail(input: {
@@ -4041,24 +5270,116 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     symbol: string;
     packageName?: string;
   }): Promise<QueryResultDto<RuntimeEntityDetailDto>> {
-    return this.runtimeService.runtimeEntityDetail(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "runtime.entity-detail",
+      input.environmentId,
+      {
+        symbol: input.symbol,
+        packageName: input.packageName
+      }
+    );
+    return adaptRuntimeEntityDetailResponse(response, input);
   }
 
   async packageBrowser(input: {
     environmentId: string;
     packageName?: string;
+    includeSymbols?: boolean;
   }): Promise<QueryResultDto<PackageBrowserDto>> {
-    return this.runtimeService.packageBrowser(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "runtime.package-browser",
+      input.environmentId,
+      { packageName: input.packageName, includeSymbols: input.includeSymbols }
+    );
+    return adaptPackageBrowserResponse(response);
   }
 
   async runtimeSymbolPage(input: RuntimeSymbolBrowserPageInput): Promise<QueryResultDto<RuntimeSymbolBrowserPageDto>> {
-    return this.runtimeService.runtimeSymbolPage(input);
+    const request: Record<string, unknown> = {
+      kinds: input.kinds,
+      visibility: input.visibility,
+      search: input.search,
+      offset: input.offset,
+      limit: input.limit
+    };
+    if (input.packageScope != null && input.packageScope.trim().length > 0) {
+      request.packageScope = input.packageScope;
+    }
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "runtime.symbol-page",
+      input.environmentId,
+      request
+    );
+    const adapted = adaptRuntimeSymbolPageResponse(response);
+    console.info(
+      "[runtime-symbol-page] env=%s scope=%s kinds=%s visibility=%s search=%s offset=%d limit=%d total=%d items=%d",
+      input.environmentId,
+      input.packageScope ?? "all",
+      (input.kinds ?? []).join(","),
+      input.visibility ?? "all",
+      input.search ?? "",
+      input.offset ?? 0,
+      input.limit ?? 0,
+      adapted.data.totalCount,
+      adapted.data.items.length
+    );
+    return adapted;
   }
 
   async fileSystemDirectory(input?: {
     path?: string;
   }): Promise<QueryResultDto<FileSystemDirectoryListingDto>> {
-    return this.sourceService.fileSystemDirectory(input);
+    const currentPath = resolve(input?.path && input.path.trim().length > 0 ? input.path : this.options.projectDir);
+    const entries = await readdir(currentPath, { withFileTypes: true }).catch((error) => {
+      if (error && typeof error === "object" && "code" in error && (error.code === "EPERM" || error.code === "EACCES")) {
+        return [];
+      }
+      throw error;
+    });
+    const directories: FileSystemEntryDto[] = [];
+    const files: FileSystemEntryDto[] = [];
+
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) {
+        continue;
+      }
+      const entryPath = resolve(currentPath, entry.name);
+      if (entry.isDirectory()) {
+        directories.push({ name: entry.name, path: entryPath, kind: "directory" });
+        continue;
+      }
+      if (entry.isFile()) {
+        files.push({ name: entry.name, path: entryPath, kind: "file" });
+        continue;
+      }
+      const entryStat = await stat(entryPath).catch(() => null);
+      if (entryStat?.isDirectory()) {
+        directories.push({ name: entry.name, path: entryPath, kind: "directory" });
+      } else if (entryStat?.isFile()) {
+        files.push({ name: entry.name, path: entryPath, kind: "file" });
+      }
+    }
+
+    directories.sort((left, right) => left.name.localeCompare(right.name));
+    files.sort((left, right) => left.name.localeCompare(right.name));
+
+    return {
+      contractVersion: 1,
+      domain: "filesystem",
+      operation: "filesystem.directory",
+      kind: "query",
+      status: "ok",
+      data: {
+        currentPath,
+        parentPath: dirname(currentPath) === currentPath ? null : dirname(currentPath),
+        directories,
+        files
+      },
+      metadata: {
+        authority: "environment",
+        binding: this.currentBinding
+      }
+    };
   }
 
   async sourcePreview(input: {
@@ -4067,7 +5388,40 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     line?: number;
     contextRadius?: number;
   }): Promise<QueryResultDto<SourcePreviewDto>> {
-    return this.sourceService.sourcePreview(input);
+    const absolutePath = input.path.startsWith("/")
+      ? input.path
+      : resolve(this.options.projectDir, input.path);
+    const content = await readFile(absolutePath, "utf8");
+    const lines = content.split("\n");
+    const focusLine = input.line ?? 1;
+    const radius = input.contextRadius ?? 8;
+    const startLine = Math.max(1, focusLine - radius);
+    const endLine = Math.min(lines.length, focusLine + radius);
+    const snippet = lines.slice(startLine - 1, endLine).join("\n");
+
+    return {
+      contractVersion: 1,
+      domain: "source",
+      operation: "source.preview",
+      kind: "query",
+      status: "ok",
+      data: {
+        path: absolutePath,
+        language: absolutePath.endsWith(".lisp") || absolutePath.endsWith(".lsp") || absolutePath.endsWith(".asd")
+          ? "lisp"
+          : "text",
+        focusLine,
+        startLine,
+        endLine,
+        summary: `Source preview for ${absolutePath}.`,
+        content: snippet,
+        editableContent: content
+      },
+      metadata: {
+        authority: "environment",
+        binding: this.currentBinding
+      }
+    };
   }
 
   async writeSourceFile(input: {
@@ -4075,7 +5429,37 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     content: string;
     overwrite?: boolean;
   }): Promise<CommandResultDto<FileSystemWriteResultDto>> {
-    return this.sourceService.writeSourceFile(input);
+    const absolutePath = input.path.startsWith("/")
+      ? input.path
+      : resolve(this.options.projectDir, input.path);
+    const existingStat = await stat(absolutePath).catch(() => null);
+    if (existingStat?.isDirectory()) {
+      throw new Error(`Cannot save source into directory path: ${absolutePath}`);
+    }
+    if (existingStat && !input.overwrite) {
+      throw new Error(`File already exists and overwrite was not confirmed: ${absolutePath}`);
+    }
+    await writeFile(absolutePath, input.content, "utf8");
+    const overwritten = Boolean(existingStat);
+
+    return {
+      contractVersion: 1,
+      domain: "filesystem",
+      operation: "filesystem.write-source-file",
+      kind: "command",
+      status: "ok",
+      data: {
+        path: absolutePath,
+        overwritten,
+        summary: overwritten
+          ? `Overwrote source file ${absolutePath}.`
+          : `Saved new source file ${absolutePath}.`
+      },
+      metadata: {
+        authority: "environment",
+        binding: this.currentBinding
+      }
+    };
   }
 
   async evaluateInContext(
@@ -4090,13 +5474,37 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
       } | null;
     }
   ): Promise<CommandResultDto<RuntimeEvalResultDto>> {
-    return this.sourceService.evaluateInContext(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "runtime.eval",
+      input.environmentId,
+      {
+        form: input.form,
+        packageName: input.packageName,
+        recoveryLaunch: input.recoveryLaunch ?? undefined
+      }
+    );
+
+    return adaptRuntimeEvalResponse(response, input);
   }
 
   async evaluateCalculator(
     input: CalculatorEvaluateInput
   ): Promise<CommandResultDto<CalculatorResultDto>> {
-    return this.sourceService.evaluateCalculator(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "calculator.evaluate",
+      input.environmentId,
+      input as unknown as Record<string, unknown>
+    );
+
+    return {
+      contractVersion: response.contractVersion,
+      domain: "calculator",
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: camelizeKeys(response.data) as CalculatorResultDto,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async stageSourceChange(input: {
@@ -4104,276 +5512,717 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     path: string;
     content: string;
   }): Promise<CommandResultDto<SourceMutationResultDto>> {
-    return this.sourceService.stageSourceChange(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "source.stage-change",
+      input.environmentId,
+      {
+        path: input.path,
+        content: input.content
+      }
+    );
+
+    return {
+      contractVersion: response.contractVersion,
+      domain: "source",
+      operation: "source.stage_change",
+      kind: "command",
+      status:
+        response.status === "awaiting-approval"
+          ? "awaiting_approval"
+          : response.status === "rejected"
+            ? "rejected"
+            : response.status === "error"
+              ? "error"
+              : "ok",
+      data: {
+        path: String(response.data.path ?? input.path),
+        summary: String(response.data.summary ?? "Source change staged through governed workspace mutation."),
+        bytesWritten: response.data.bytesWritten ? Number(response.data.bytesWritten) : input.content.length,
+        artifactIds: asStringArray(response.data.artifactIds),
+        approvalId: response.data.approvalId ? String(response.data.approvalId) : null,
+        workItemId: response.data.workItemId ? String(response.data.workItemId) : null
+      },
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async reloadSourceFile(input: {
     environmentId: string;
     path: string;
   }): Promise<CommandResultDto<SourceReloadResultDto>> {
-    return this.sourceService.reloadSourceFile(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "runtime.reload-file",
+      input.environmentId,
+      { path: input.path }
+    );
+
+    return {
+      contractVersion: response.contractVersion,
+      domain: "runtime",
+      operation: "runtime.reload_file",
+      kind: "command",
+      status:
+        response.status === "awaiting-approval"
+          ? "awaiting_approval"
+          : response.status === "rejected"
+            ? "rejected"
+            : response.status === "error"
+              ? "error"
+              : "ok",
+      data: {
+        path: String(response.data.path ?? input.path),
+        summary: String(response.data.summary ?? "Runtime reload executed for the selected source file."),
+        artifactIds: asStringArray(response.data.artifactIds),
+        approvalId: response.data.approvalId ? String(response.data.approvalId) : null,
+        incidentId: response.data.incidentId ? String(response.data.incidentId) : null,
+        workItemId: response.data.workItemId ? String(response.data.workItemId) : null
+      },
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async desktopAction(
     input: DesktopActionInput
   ): Promise<CommandResultDto<DesktopActionResultDto>> {
-    return this.hostUtilityService.desktopAction(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop.action",
+      input.environmentId,
+      camelizeKeys({
+        actionId: input.actionId,
+        actionKind: input.actionKind,
+        panelId: input.panelId,
+        command: input.command,
+        index: input.index,
+        executionId: input.executionId,
+        objectKind: input.objectKind,
+        params: input.params
+      }) as Record<string, unknown>
+    );
+    return adaptDesktopActionResponse(response);
   }
 
   async desktopRestore(
     input: DesktopRestoreInput
   ): Promise<CommandResultDto<DesktopRestoreResultDto>> {
-    return this.hostUtilityService.desktopRestore(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop.restore",
+      input.environmentId,
+      camelizeKeys({
+        panelId: input.panelId,
+        panelState: input.panelState
+      }) as Record<string, unknown>
+    );
+    return adaptDesktopRestoreResponse(response);
   }
 
   async approvalRequestList(
     environmentId?: string
   ): Promise<QueryResultDto<ApprovalRequestSummaryDto[]>> {
-    return this.incidentService.approvalRequestList(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "approval.list",
+      environmentId
+    );
+    return adaptApprovalListResponse(response);
   }
 
   async approvalRequestDetail(
     requestId: string,
     environmentId?: string
   ): Promise<QueryResultDto<ApprovalRequestDto>> {
-    return this.incidentService.approvalRequestDetail(requestId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "approval.detail",
+      environmentId,
+      { requestId }
+    );
+    return adaptApprovalDetailResponse(response);
   }
 
   async approveRequest(
     input: ApprovalDecisionInput
   ): Promise<CommandResultDto<ApprovalDecisionDto>> {
-    return this.incidentService.approveRequest(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "approval.approve",
+      input.environmentId,
+      { requestId: input.requestId }
+    );
+
+    return {
+      contractVersion: response.contractVersion,
+      domain: "approval",
+      operation: "approval.approve",
+      kind: "command",
+      status: response.status === "error" ? "error" : "ok",
+      data: {
+        requestId: String(response.data.requestId ?? input.requestId),
+        decision: "approved",
+        summary: String(
+          response.data.summary ?? "Approval granted. Governed work resumed in the live environment."
+        ),
+        resumedEntityIds: asStringArray(response.data.resumedEntityIds)
+      },
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async denyRequest(input: ApprovalDecisionInput): Promise<CommandResultDto<ApprovalDecisionDto>> {
-    return this.incidentService.denyRequest(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "approval.deny",
+      input.environmentId,
+      { requestId: input.requestId }
+    );
+
+    return {
+      contractVersion: response.contractVersion,
+      domain: "approval",
+      operation: "approval.deny",
+      kind: "command",
+      status: response.status === "error" ? "error" : "ok",
+      data: {
+        requestId: String(response.data.requestId ?? input.requestId),
+        decision: "denied",
+        summary: String(
+          response.data.summary ??
+            "Approval denied. The governed work item has been moved into operator review."
+        ),
+        resumedEntityIds: asStringArray(response.data.resumedEntityIds)
+      },
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async incidentList(environmentId?: string): Promise<QueryResultDto<IncidentSummaryDto[]>> {
-    return this.incidentService.incidentList(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "incident.list",
+      environmentId
+    );
+    return adaptIncidentListResponse(response);
   }
 
   async incidentDetail(
     incidentId: string,
     environmentId?: string
   ): Promise<QueryResultDto<IncidentDetailDto>> {
-    return this.incidentService.incidentDetail(incidentId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "incident.detail",
+      environmentId,
+      { incidentId }
+    );
+    return adaptIncidentDetailResponse(response);
   }
 
   async updateIncidentRemediationPlan(
     input: UpdateIncidentRemediationPlanInput
   ): Promise<CommandResultDto<IncidentDetailDto>> {
-    return this.incidentService.updateIncidentRemediationPlan(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "incident.set-remediation-plan",
+      input.environmentId,
+      {
+        incidentId: input.incidentId,
+        remediationPlan: input.remediationPlan
+      }
+    );
+    const adapted = adaptIncidentDetailResponse(response);
+    return {
+      ...adapted,
+      kind: "command",
+      status: response.status === "error" ? "error" : "ok"
+    };
   }
 
   async createIntent(
     input: CreateIntentInput
   ): Promise<CommandResultDto<IntentDetailDto>> {
-    return this.workflowService.createIntent(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "intent.create",
+      input.environmentId,
+      {
+        description: input.description,
+        scope: input.scope,
+        constraints: input.constraints,
+        expectedBehaviors: input.expectedBehaviors,
+        nonGoals: input.nonGoals,
+        priority: input.priority,
+        version: input.version,
+        status: input.status,
+        linkedRuntimeObjects: input.linkedRuntimeObjects,
+        linkedSourceArtifacts: input.linkedSourceArtifacts,
+        linkedEventIds: input.linkedEventIds,
+        linkedMutationIds: input.linkedMutationIds,
+        metadata: input.metadata
+      }
+    );
+
+    return {
+      contractVersion: response.contractVersion,
+      domain: "intent",
+      operation: "intent.create",
+      kind: "command",
+      status: response.status === "error" ? "error" : "ok",
+      data: adaptIntentDetail(asRecord(response.data)) ?? {
+        id: "",
+        description: input.description,
+        status: input.status ?? "active",
+        priority: input.priority ?? null,
+        version: input.version ?? 1,
+        scopeSummary: null,
+        linkedRuntimeObjectCount: 0,
+        linkedSourceArtifactCount: 0,
+        linkedEventCount: 0,
+        linkedMutationCount: 0,
+        createdAt: null,
+        updatedAt: null,
+        scope: input.scope ?? null,
+        constraints: input.constraints ?? [],
+        expectedBehaviors: input.expectedBehaviors ?? [],
+        nonGoals: input.nonGoals ?? [],
+        linkedRuntimeObjects: input.linkedRuntimeObjects ?? [],
+        linkedSourceArtifacts: input.linkedSourceArtifacts ?? [],
+        linkedEventIds: input.linkedEventIds ?? [],
+        linkedMutationIds: input.linkedMutationIds ?? [],
+        metadata: input.metadata ?? null,
+        current: true,
+        diff: null
+      },
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async createProject(
     input: CreateProjectInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.createProject(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.create",
+      input.environmentId,
+      {
+        title: input.title,
+        summary: input.summary
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async updateProjectConstitution(
     input: UpdateProjectConstitutionInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.updateProjectConstitution(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.set-constitution",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        constitution: input.constitution
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async updateProjectDesignSystem(
     input: UpdateProjectDesignSystemInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.updateProjectDesignSystem(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.set-design-system",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        designSystem: input.designSystem
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async updateProjectStyleGuide(
     input: UpdateProjectStyleGuideInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.updateProjectStyleGuide(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.set-style-guide",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        styleGuide: input.styleGuide
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async updateProjectTestingStrategy(
     input: UpdateProjectTestingStrategyInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.updateProjectTestingStrategy(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.set-testing-strategy",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        testingStrategy: input.testingStrategy
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async updateProjectReleaseReadiness(
     input: UpdateProjectReleaseReadinessInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.updateProjectReleaseReadiness(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.set-release-readiness",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        releaseReadiness: input.releaseReadiness
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async updateProjectReadinessObligations(
     input: UpdateProjectReadinessObligationsInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.updateProjectReadinessObligations(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.set-readiness-obligations",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        readinessObligations: input.readinessObligations
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async appendProjectRequirement(
     input: AppendProjectRequirementInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.appendProjectRequirement(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.append-requirement",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        id: input.id,
+        title: input.title,
+        summary: input.summary,
+        scope: input.scope,
+        kind: input.kind,
+        priority: input.priority,
+        status: input.status,
+        verificationKind: input.verificationKind,
+        linkedArtifactIds: input.linkedArtifactIds,
+        nonFunctional: input.nonFunctional
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async appendProjectFeatureSpecification(
     input: AppendProjectFeatureSpecificationInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.appendProjectFeatureSpecification(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.append-feature-specification",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        id: input.id,
+        title: input.title,
+        summary: input.summary,
+        status: input.status,
+        acceptanceCriteria: input.acceptanceCriteria,
+        linkedRequirementIds: input.linkedRequirementIds,
+        linkedJourneyIds: input.linkedJourneyIds
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async appendProjectUserJourney(
     input: AppendProjectUserJourneyInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.appendProjectUserJourney(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.append-user-journey",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        id: input.id,
+        title: input.title,
+        summary: input.summary,
+        actors: input.actors,
+        entrypoints: input.entrypoints,
+        steps: input.steps,
+        outcomes: input.outcomes,
+        edgeCases: input.edgeCases
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async appendProjectArchitectureDecision(
     input: AppendProjectArchitectureDecisionInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.appendProjectArchitectureDecision(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.append-architecture-decision",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        id: input.id,
+        title: input.title,
+        summary: input.summary,
+        status: input.status,
+        drivers: input.drivers,
+        consequences: input.consequences,
+        stackChoices: input.stackChoices,
+        linkedRequirementIds: input.linkedRequirementIds
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async appendProjectSourceRoot(
     input: AppendProjectSourceRootInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.appendProjectSourceRoot(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.append-source-root",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        sourceRoot: input.sourceRoot
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async bindProjectTestingHarness(
     input: BindProjectTestingHarnessInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.bindProjectTestingHarness(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.bind-testing-harness",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        harnessId: input.harnessId
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async appendProjectQualityGate(
     input: AppendProjectQualityGateInput
   ): Promise<CommandResultDto<ProjectDetailDto>> {
-    return this.workflowService.appendProjectQualityGate(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.append-quality-gate",
+      input.environmentId,
+      {
+        projectId: input.projectId,
+        id: input.id,
+        title: input.title,
+        summary: input.summary,
+        status: input.status,
+        requiredHarnessIds: input.requiredHarnessIds,
+        minimumLinkedWorkItems: input.minimumLinkedWorkItems,
+        minimumLinkedIncidents: input.minimumLinkedIncidents,
+        requireSourceRoots: input.requireSourceRoots,
+        requiredTraceTargetKinds: input.requiredTraceTargetKinds,
+        maximumFailedTests: input.maximumFailedTests,
+        requireCoverage: input.requireCoverage,
+        maximumSayTurnLatencySeconds: input.maximumSayTurnLatencySeconds,
+        maximumEnvironmentSaveLoadSeconds: input.maximumEnvironmentSaveLoadSeconds,
+        requireRecoveryReady: input.requireRecoveryReady
+      }
+    );
+    return adaptCreateProjectResponse(response);
   }
 
   async resumeWorkItem(
     input: ResumeWorkItemInput
   ): Promise<CommandResultDto<WorkItemDetailDto>> {
-    return this.workflowService.resumeWorkItem(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "work-item.resume",
+      input.environmentId,
+      {
+        workItemId: input.workItemId,
+        note: input.note
+      }
+    );
+    return adaptWorkItemDetailCommandResponse(response);
   }
 
   async quarantineWorkItem(
     input: QuarantineWorkItemInput
   ): Promise<CommandResultDto<WorkItemDetailDto>> {
-    return this.workflowService.quarantineWorkItem(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "work-item.quarantine",
+      input.environmentId,
+      {
+        workItemId: input.workItemId,
+        reason: input.reason
+      }
+    );
+    return adaptWorkItemDetailCommandResponse(response);
   }
 
   async rollbackWorkItem(
     input: RollbackWorkItemInput
   ): Promise<CommandResultDto<WorkItemDetailDto>> {
-    return this.workflowService.rollbackWorkItem(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "work-item.rollback",
+      input.environmentId,
+      {
+        workItemId: input.workItemId,
+        reason: input.reason,
+        note: input.note
+      }
+    );
+    return adaptWorkItemDetailCommandResponse(response);
   }
 
   async completeWorkItemValidations(
     input: CompleteWorkItemValidationsInput
   ): Promise<CommandResultDto<WorkItemDetailDto>> {
-    return this.workflowService.completeWorkItemValidations(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "work-item.complete-validations",
+      input.environmentId,
+      {
+        workItemId: input.workItemId,
+        status: input.status
+      }
+    );
+    return adaptWorkItemDetailCommandResponse(response);
   }
 
   async steerWorkItem(
     input: SteerWorkItemInput
   ): Promise<CommandResultDto<WorkItemDetailDto>> {
-    return this.workflowService.steerWorkItem(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "work-item.steer",
+      input.environmentId,
+      {
+        workItemId: input.workItemId,
+        phase: input.phase,
+        nextStep: input.nextStep,
+        note: input.note
+      }
+    );
+    return adaptWorkItemDetailCommandResponse(response);
   }
 
   async projectList(environmentId?: string): Promise<QueryResultDto<ProjectListDto>> {
-    return this.workflowService.projectList(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.list",
+      environmentId
+    );
+    return adaptProjectListResponse(response);
   }
 
   async projectTestingHarnessInventory(environmentId?: string): Promise<QueryResultDto<ProjectTestingHarnessDto[]>> {
-    return this.workflowService.projectTestingHarnessInventory(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>[]>>(
+      "project.testing-harness-inventory",
+      environmentId
+    );
+    return {
+      contractVersion: response.contractVersion ?? 1,
+      domain: String(response.domain ?? "project"),
+      operation: String(response.operation ?? "testing-harness-inventory"),
+      kind: "query",
+      status: String(response.status ?? "ok") as "ok" | "error",
+      data: Array.isArray(response.data) ? response.data.map(adaptProjectTestingHarness) : [],
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async projectDetail(projectId: string, environmentId?: string): Promise<QueryResultDto<ProjectDetailDto>> {
-    return this.workflowService.projectDetail(projectId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "project.detail",
+      environmentId,
+      { projectId }
+    );
+    return adaptProjectDetailResponse(response);
   }
 
   async workItemList(environmentId?: string): Promise<QueryResultDto<WorkItemSummaryDto[]>> {
-    return this.workflowService.workItemList(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "work-item.list",
+      environmentId
+    );
+    return adaptWorkItemListResponse(response);
   }
 
   async workItemDetail(
     workItemId: string,
     environmentId?: string
   ): Promise<QueryResultDto<WorkItemDetailDto>> {
-    return this.workflowService.workItemDetail(workItemId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "work-item.detail",
+      environmentId,
+      { workItemId }
+    );
+    return adaptWorkItemDetailResponse(response);
   }
 
   async workItemPlan(
     workItemId: string,
     environmentId?: string
   ): Promise<QueryResultDto<WorkItemPlanDto>> {
-    return this.workflowService.workItemPlan(workItemId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "work-item.plan",
+      environmentId,
+      { workItemId }
+    );
+    return adaptWorkItemPlanResponse(response);
   }
 
   async workflowRecordDetail(
     workflowRecordId: string,
     environmentId?: string
   ): Promise<QueryResultDto<WorkflowRecordDto>> {
-    return this.workflowService.workflowRecordDetail(workflowRecordId, environmentId);
-  }
-
-  async orchestrationList(environmentId?: string): Promise<QueryResultDto<Record<string, unknown>[]>> {
-    return this.configurationService.orchestrationList(environmentId);
-  }
-
-  async orchestrationInbox(environmentId?: string): Promise<QueryResultDto<Record<string, unknown>[]>> {
-    return this.configurationService.orchestrationInbox(environmentId);
-  }
-
-  async orchestrationFocus(input?: {
-    environmentId?: string;
-    planId?: string;
-    workflowRecordId?: string;
-    workItemId?: string;
-  }): Promise<QueryResultDto<Record<string, unknown>>> {
-    return this.configurationService.orchestrationFocus(input);
-  }
-
-  async orchestrationSnapshot(input?: {
-    environmentId?: string;
-    planId?: string;
-  }): Promise<QueryResultDto<Record<string, unknown>>> {
-    return this.configurationService.orchestrationSnapshot(input);
-  }
-
-  async planVerification(input?: {
-    environmentId?: string;
-    planId?: string;
-  }): Promise<QueryResultDto<Record<string, unknown>>> {
-    return this.configurationService.planVerification(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "workflow.record-detail",
+      environmentId,
+      { workflowRecordId }
+    );
+    return adaptWorkflowRecordDetailResponse(response);
   }
 
   async providerProfiles(environmentId?: string): Promise<QueryResultDto<ProviderProfileSummaryDto>> {
-    return this.configurationService.providerProfiles(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.provider.get",
+      environmentId
+    );
+    return adaptProviderSummaryResponse(response);
   }
 
   async packageManagementSummary(
     environmentId?: string
   ): Promise<QueryResultDto<PackageManagementSummaryDto>> {
-    return this.configurationService.packageManagementSummary(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "package-management.summary",
+      environmentId
+    );
+    return adaptPackageManagementSummaryResponse(response);
   }
 
   async desktopTaskManifests(environmentId?: string): Promise<QueryResultDto<DesktopTaskManifestDto[]>> {
-    return this.configurationService.desktopTaskManifests(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "desktop-task.manifests",
+      environmentId
+    );
+    return adaptDesktopTaskManifestListResponse(response);
   }
 
   async desktopTaskRecords(environmentId?: string): Promise<QueryResultDto<DesktopTaskRecordDto[]>> {
-    return this.configurationService.desktopTaskRecords(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "desktop-task.records",
+      environmentId
+    );
+    return adaptDesktopTaskRecordListResponse(response);
   }
 
   async desktopTaskPendingApproval(environmentId?: string): Promise<QueryResultDto<Record<string, unknown>>> {
-    return this.configurationService.desktopTaskPendingApproval(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop-task.pending-approval",
+      environmentId
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "desktop-task",
+      operation: response.operation,
+      kind: "query",
+      status: response.status === "error" ? "error" : "ok",
+      data: camelizeKeys(asRecord(response.data)) as Record<string, unknown>,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async desktopTaskActorFlow(input?: {
@@ -4385,14 +6234,61 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     scopeId?: string;
     latestOnlyP?: boolean;
   }): Promise<QueryResultDto<Record<string, unknown>>> {
-    return this.configurationService.desktopTaskActorFlow(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop-task.actor-flow",
+      input?.environmentId,
+      {
+        sessionId: input?.sessionId,
+        approvalId: input?.approvalId,
+        pendingActionId: input?.pendingActionId,
+        actorMessageId: input?.actorMessageId,
+        scopeId: input?.scopeId,
+        latestOnlyP: input?.latestOnlyP
+      }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "desktop-task",
+      operation: response.operation,
+      kind: "query",
+      status: response.status === "error" ? "error" : "ok",
+      data: camelizeKeys(asRecord(response.data)) as Record<string, unknown>,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async desktopTaskActorSystemPanel(input?: {
     environmentId?: string;
     sessionId?: string;
   }): Promise<QueryResultDto<Record<string, unknown>>> {
-    return this.configurationService.desktopTaskActorSystemPanel(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop-task.actor-system-panel",
+      input?.environmentId,
+      {
+        sessionId: input?.sessionId
+      }
+    );
+    console.info(
+      "[actor-system-panel-bridge] %s",
+      JSON.stringify({
+        status: response.status,
+        rootActorId: (response.data as Record<string, unknown> | undefined)?.root_actor_id ?? null,
+        actorCount:
+          Array.isArray((response.data as Record<string, unknown> | undefined)?.actors)
+            ? ((response.data as Record<string, unknown>).actors as unknown[]).length
+            : null,
+        keys: Object.keys(asRecord(response.data))
+      })
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "desktop-task",
+      operation: response.operation,
+      kind: "query",
+      status: response.status === "error" ? "error" : "ok",
+      data: camelizeKeys(asRecord(response.data)) as Record<string, unknown>,
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async desktopTaskActorTrace(input?: {
@@ -4403,93 +6299,275 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     latestOnlyP?: boolean;
     deadLettersOnlyP?: boolean;
   }): Promise<QueryResultDto<Record<string, unknown>[]>> {
-    return this.configurationService.desktopTaskActorTrace(input);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "desktop-task.actor-trace",
+      input?.environmentId,
+      {
+        actorRole: input?.actorRole,
+        actorMessageId: input?.actorMessageId,
+        phase: input?.phase,
+        latestOnlyP: input?.latestOnlyP,
+        deadLettersOnlyP: input?.deadLettersOnlyP
+      }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "desktop-task",
+      operation: response.operation,
+      kind: "query",
+      status: response.status === "error" ? "error" : "ok",
+      data: asRecordArray(response.data).map((entry) => camelizeKeys(asRecord(entry)) as Record<string, unknown>),
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async desktopTaskDeadLetterQueue(input?: {
     environmentId?: string;
     actorRole?: string;
   }): Promise<QueryResultDto<Record<string, unknown>[]>> {
-    return this.configurationService.desktopTaskDeadLetterQueue(input);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "desktop-task.dlq",
+      input?.environmentId,
+      { actorRole: input?.actorRole }
+    );
+    return {
+      contractVersion: response.contractVersion,
+      domain: "desktop-task",
+      operation: response.operation,
+      kind: "query",
+      status: response.status === "error" ? "error" : "ok",
+      data: asRecordArray(response.data).map((entry) => camelizeKeys(asRecord(entry)) as Record<string, unknown>),
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async mcpServerConfigs(environmentId?: string): Promise<QueryResultDto<McpServerConfigDto[]>> {
-    return this.configurationService.mcpServerConfigs(environmentId);
+    const response = await this.invokeService<RawServiceResponse<Array<Record<string, unknown>>>>(
+      "desktop-task.mcp-servers",
+      environmentId
+    );
+    return adaptMcpServerConfigListResponse(response);
   }
 
   async mcpServerConfig(
     serverId: string,
     environmentId?: string
   ): Promise<QueryResultDto<McpServerConfigDto>> {
-    return this.configurationService.mcpServerConfig(serverId, environmentId);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop-task.mcp-server",
+      environmentId,
+      { serverId }
+    );
+    return adaptMcpServerConfigDetailResponse(response);
   }
 
   async focusWorkspace(workspace: WorkspaceId): Promise<void> {
-    await this.desktopPreferencesService.focusWorkspace(workspace);
+    this.focusedWorkspaceOverride = workspace;
+    this.preferences.lastWorkspace = workspace;
+    await this.setDesktopPreferences({ lastWorkspace: workspace });
   }
 
   async getDesktopPreferences(): Promise<DesktopPreferencesDto> {
-    return this.desktopPreferencesService.getDesktopPreferences();
+    const response = await this.invokeService<RawServiceResponse<Partial<DesktopPreferencesDto>>>(
+      "desktop.preferences.get",
+      this.currentBinding?.environmentId
+    );
+    this.preferences = mergeDesktopPreferences(
+      this.preferences,
+      normalizeDesktopPreferencesPayload(response.data)
+    );
+    if (this.focusedWorkspaceOverride) {
+      this.preferences.lastWorkspace = this.focusedWorkspaceOverride;
+    }
+    return this.preferences;
   }
 
   async setDesktopPreferences(
     patch: Partial<DesktopPreferencesDto>
   ): Promise<DesktopPreferencesDto> {
-    return this.desktopPreferencesService.setDesktopPreferences(patch);
+    const write = async (): Promise<DesktopPreferencesDto> => {
+      const nextPreferences = mergeDesktopPreferences(this.preferences, patch);
+      if (this.bindingTransitionInFlight) {
+        if (patch.lastWorkspace) {
+          this.focusedWorkspaceOverride = patch.lastWorkspace;
+        }
+        this.preferences = nextPreferences;
+        return this.preferences;
+      }
+      const response = await this.invokeService<RawServiceResponse<Partial<DesktopPreferencesDto>>>(
+        "desktop.preferences.set",
+        this.currentBinding?.environmentId,
+        { desktopPreferences: nextPreferences }
+      );
+      if (patch.lastWorkspace) {
+        this.focusedWorkspaceOverride = patch.lastWorkspace;
+      }
+      this.preferences = mergeDesktopPreferences(
+        nextPreferences,
+        normalizeDesktopPreferencesPayload(response.data)
+      );
+      return this.preferences;
+    };
+
+    const queued = this.desktopPreferencesWriteQueue.catch(() => this.preferences).then(write);
+    this.desktopPreferencesWriteQueue = queued.catch(() => this.preferences);
+    return queued;
   }
 
   async configureProviderProfile(
     input: ConfigureProviderProfileInput
   ): Promise<CommandResultDto<ProviderProfileSummaryDto>> {
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.provider.configure",
+      this.currentBinding?.environmentId,
+      input as unknown as Record<string, unknown>
+    );
+    const summary = adaptProviderSummaryResponse(response);
     if (input.activate) {
       return this.useProviderProfile({ profileName: input.profileName });
     }
-    return this.configurationService.configureProviderProfile(this.currentBinding?.environmentId, input);
+    return {
+      contractVersion: response.contractVersion,
+      domain: response.domain,
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: summary.data,
+      metadata: summary.metadata
+    };
   }
 
   async useProviderProfile(
     input: UseProviderProfileInput
   ): Promise<CommandResultDto<ProviderProfileSummaryDto>> {
-    return this.configurationService.useProviderProfile(this.currentBinding?.environmentId, input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.provider.use",
+      this.currentBinding?.environmentId,
+      input as unknown as Record<string, unknown>
+    );
+    const summary = adaptProviderSummaryResponse(response);
+    return {
+      contractVersion: response.contractVersion,
+      domain: response.domain,
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: summary.data,
+      metadata: summary.metadata
+    };
   }
 
   async updateProviderRouting(
     input: UpdateProviderRoutingInput
   ): Promise<CommandResultDto<ProviderProfileSummaryDto>> {
-    return this.configurationService.updateProviderRouting(this.currentBinding?.environmentId, input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "environment.provider.routing",
+      this.currentBinding?.environmentId,
+      input as unknown as Record<string, unknown>
+    );
+    const summary = adaptProviderSummaryResponse(response);
+    return {
+      contractVersion: response.contractVersion,
+      domain: response.domain,
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: summary.data,
+      metadata: summary.metadata
+    };
   }
 
   async configureMcpServer(
     input: ConfigureMcpServerInput
   ): Promise<CommandResultDto<McpServerConfigDto>> {
-    return this.configurationService.configureMcpServer(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop-task.configure-mcp-server",
+      input.environmentId,
+      {
+        serverId: input.serverId,
+        name: input.name,
+        transport: input.transport,
+        command: input.command,
+        arguments: input.arguments,
+        environmentVariables: input.environmentVariables,
+        workingDirectory: input.workingDirectory,
+        endpoint: input.endpoint,
+        capabilities: input.capabilities,
+        retryPolicy: input.retryPolicy,
+        healthStatus: input.healthStatus,
+        enabledP: input.enabledP,
+        discoverableP: input.discoverableP
+      } as unknown as Record<string, unknown>
+    );
+    const detail = adaptMcpServerConfigDetailResponse(response);
+    return {
+      contractVersion: response.contractVersion,
+      domain: response.domain,
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: detail.data,
+      metadata: detail.metadata
+    };
   }
 
   async removeMcpServer(
     input: RemoveMcpServerInput
   ): Promise<CommandResultDto<{ id: string; removedP: boolean }>> {
-    return this.configurationService.removeMcpServer(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "desktop-task.remove-mcp-server",
+      input.environmentId,
+      { serverId: input.serverId }
+    );
+    const data = camelizeKeys(response.data) as Record<string, unknown>;
+    return {
+      contractVersion: response.contractVersion,
+      domain: response.domain,
+      operation: response.operation,
+      kind: "command",
+      status: normalizeCommandStatus(response.status),
+      data: {
+        id: firstString(data.id) ?? input.serverId,
+        removedP: Boolean(data.removedP ?? data.removed)
+      },
+      metadata: normalizeMetadata(response.metadata)
+    };
   }
 
   async installQuicklispPackage(input: {
     environmentId: string;
     systemName: string;
   }): Promise<CommandResultDto<PackageManagementCommandResultDto>> {
-    return this.configurationService.installQuicklispPackage(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "package-management.install-quicklisp",
+      input.environmentId,
+      { systemName: input.systemName }
+    );
+    return adaptPackageManagementCommandResponse(response);
   }
 
   async runQlotCommand(input: {
     environmentId: string;
     args: string[];
   }): Promise<CommandResultDto<PackageManagementCommandResultDto>> {
-    return this.configurationService.runQlotCommand(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "package-management.run-qlot",
+      input.environmentId,
+      { args: input.args }
+    );
+    return adaptPackageManagementCommandResponse(response);
   }
 
   async addSourceRegistryEntry(input: {
     environmentId: string;
     path: string;
   }): Promise<CommandResultDto<PackageManagementCommandResultDto>> {
-    return this.configurationService.addSourceRegistryEntry(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "package-management.add-source-registry-entry",
+      input.environmentId,
+      { path: input.path }
+    );
+    return adaptPackageManagementCommandResponse(response);
   }
 
   async updateSourceRegistryEntry(input: {
@@ -4497,14 +6575,24 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     oldPath: string;
     newPath: string;
   }): Promise<CommandResultDto<PackageManagementCommandResultDto>> {
-    return this.configurationService.updateSourceRegistryEntry(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "package-management.update-source-registry-entry",
+      input.environmentId,
+      { oldPath: input.oldPath, newPath: input.newPath }
+    );
+    return adaptPackageManagementCommandResponse(response);
   }
 
   async removeSourceRegistryEntry(input: {
     environmentId: string;
     path: string;
   }): Promise<CommandResultDto<PackageManagementCommandResultDto>> {
-    return this.configurationService.removeSourceRegistryEntry(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "package-management.remove-source-registry-entry",
+      input.environmentId,
+      { path: input.path }
+    );
+    return adaptPackageManagementCommandResponse(response);
   }
 
   async addLocalProject(input: {
@@ -4512,14 +6600,24 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     path: string;
     name?: string;
   }): Promise<CommandResultDto<PackageManagementCommandResultDto>> {
-    return this.configurationService.addLocalProject(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "package-management.add-local-project",
+      input.environmentId,
+      { path: input.path, name: input.name }
+    );
+    return adaptPackageManagementCommandResponse(response);
   }
 
   async removeLocalProject(input: {
     environmentId: string;
     name: string;
   }): Promise<CommandResultDto<PackageManagementCommandResultDto>> {
-    return this.configurationService.removeLocalProject(input);
+    const response = await this.invokeService<RawServiceResponse<Record<string, unknown>>>(
+      "package-management.remove-local-project",
+      input.environmentId,
+      { name: input.name }
+    );
+    return adaptPackageManagementCommandResponse(response);
   }
 
   async quitApp(): Promise<void> {
@@ -4545,11 +6643,16 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
 
     const requested = requestedEnvironmentId?.trim();
     const meaningfulRequested = Boolean(requested) && requested !== DEFAULT_LIVE_BINDING.environmentId;
+    const currentEnvironmentId = this.currentBinding?.environmentId ?? null;
+    const driftMatchesCurrentBinding =
+      Boolean(currentEnvironmentId) && binding.environmentId === currentEnvironmentId;
 
     if (
       meaningfulRequested &&
       !this.shouldIgnoreBindingDriftForOperation(operation) &&
-      binding.environmentId !== requested
+      !this.bindingTransitionInFlight &&
+      binding.environmentId !== requested &&
+      !driftMatchesCurrentBinding
     ) {
       throw new Error(
         `Bridge binding drift for ${operation}: requested ${requested} but received ${binding.environmentId}.`
@@ -4567,15 +6670,70 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     environmentId?: string,
     request?: Record<string, unknown>
   ): Promise<T> {
-    const parsed = await this.persistentBridge.invoke<RawServiceResponse<unknown>>(
+    if (this.options.transport !== "pipe") {
+      throw new Error(
+        `Live adapter transport '${this.options.transport}' is configured, but only the initial pipe bridge is implemented.`
+      );
+    }
+
+    const startedAt = performance.now();
+    const route = this.bridgeRouteForOperation(operation);
+    const state = this.bridgeState(route);
+    const child = await this.ensurePersistentBridgeForRoute(route);
+    const id = ++state.requestId;
+    const payload = {
+      id,
       operation,
-      environmentId,
-      request,
-      "persistent-pipe"
-    );
-    const binding = parsed.metadata?.binding as BindingDto | null | undefined;
-    this.adoptResponseBinding(operation, environmentId, binding);
-    return parsed as T;
+      environmentId: environmentId ?? null,
+      request: request ?? null
+    };
+    if (operation === "runtime.symbol-page") {
+      console.info("[runtime-symbol-page-payload] %s", JSON.stringify(payload));
+    }
+    return new Promise<T>((resolvePromise, rejectPromise) => {
+      state.pending.set(id, {
+        operation,
+        startedAt,
+        resolve: (value) => {
+          try {
+            const parsed = value as RawServiceResponse<unknown>;
+            const binding = normalizeMetadata(parsed.metadata).binding;
+            this.adoptResponseBinding(operation, environmentId, binding);
+            if (
+              route === "write" &&
+              parsed.status === "ok" &&
+              this.shouldInvalidateReadBridgeAfterWrite(operation)
+            ) {
+              this.invalidateReadBridge(operation);
+            }
+            console.info(
+              "[bridge-perf] operation=%s durationMs=%d status=ok transport=persistent-pipe-%s",
+              operation,
+              Math.round(performance.now() - startedAt),
+              route
+            );
+            resolvePromise(parsed as T);
+          } catch (error) {
+            rejectPromise(error as Error);
+          }
+        },
+        reject: (error) => {
+          console.info(
+            "[bridge-perf] operation=%s durationMs=%d status=error transport=persistent-pipe-%s",
+            operation,
+            Math.round(performance.now() - startedAt),
+            route
+          );
+          rejectPromise(error);
+        }
+      });
+      child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+        if (error) {
+          state.pending.delete(id);
+          rejectPromise(error);
+        }
+      });
+    });
   }
 
   private async invokeStreamingService<T>(
@@ -4584,21 +6742,73 @@ export class LiveSbclAgentHostAdapter implements SbclAgentHostAdapter {
     request: Record<string, unknown>,
     onEvent?: (event: EnvironmentEventDto) => void
   ): Promise<T> {
+    if (this.options.transport !== "pipe") {
+      throw new Error(
+        `Live adapter transport '${this.options.transport}' is configured, but only the initial pipe bridge is implemented.`
+      );
+    }
+
+    const startedAt = performance.now();
+    const route = this.bridgeRouteForOperation(operation);
+    const state = this.bridgeState(route);
+    const child = await this.ensurePersistentBridgeForRoute(route);
+    const id = ++state.requestId;
+    const payload = {
+      id,
+      operation,
+      environmentId: environmentId ?? null,
+      request: request ?? null
+    };
     if (onEvent) {
       console.info(
         "[live-host-adapter] streaming operation=%s is using persistent bridge result mode; provider stream events are not yet forwarded inline",
         operation
       );
     }
-    const parsed = await this.persistentBridge.invoke<RawServiceResponse<unknown>>(
-      operation,
-      environmentId,
-      request,
-      "persistent-pipe-stream"
-    );
-    const binding = parsed.metadata?.binding as BindingDto | null | undefined;
-    this.adoptResponseBinding(operation, environmentId, binding);
-    return parsed as T;
+    return new Promise<T>((resolvePromise, rejectPromise) => {
+      state.pending.set(id, {
+        operation,
+        startedAt,
+        resolve: (value) => {
+          try {
+            const parsed = value as RawServiceResponse<unknown>;
+            const binding = normalizeMetadata(parsed.metadata).binding;
+            this.adoptResponseBinding(operation, environmentId, binding);
+            if (
+              route === "write" &&
+              parsed.status === "ok" &&
+              this.shouldInvalidateReadBridgeAfterWrite(operation)
+            ) {
+              this.invalidateReadBridge(operation);
+            }
+            console.info(
+              "[bridge-perf] operation=%s durationMs=%d status=ok transport=persistent-pipe-stream-%s",
+              operation,
+              Math.round(performance.now() - startedAt),
+              route
+            );
+            resolvePromise(parsed as T);
+          } catch (error) {
+            rejectPromise(error as Error);
+          }
+        },
+        reject: (error) => {
+          console.info(
+            "[bridge-perf] operation=%s durationMs=%d status=error transport=persistent-pipe-stream-%s",
+            operation,
+            Math.round(performance.now() - startedAt),
+            route
+          );
+          rejectPromise(error);
+        }
+      });
+      child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+        if (error) {
+          state.pending.delete(id);
+          rejectPromise(error);
+        }
+      });
+    });
   }
 }
 

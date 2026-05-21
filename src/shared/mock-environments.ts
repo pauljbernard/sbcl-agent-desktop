@@ -2988,10 +2988,22 @@ export function queryRuntimeEntityDetail(input: {
 export function queryPackageBrowser(input: {
   environmentId: string;
   packageName?: string;
+  includeSymbols?: boolean;
 }): QueryResultDto<PackageBrowserDto> {
   const binding = { environmentId: input.environmentId };
   const runtime = environments[input.environmentId].runtimeSummary;
   const packageName = input.packageName ?? runtime.currentPackage;
+  const includeSymbols = input.includeSymbols !== false;
+  const externalSymbols = [
+    { symbol: "START-SHELL", kind: "function", visibility: "external" },
+    { symbol: "RUN-CONVERSATION-TURN", kind: "generic-function", visibility: "external" },
+    { symbol: "MAKE-DEFAULT-ENVIRONMENT", kind: "function", visibility: "external" }
+  ] as const;
+  const internalSymbols = [
+    { symbol: "CURRENT-THREAD", kind: "variable", visibility: "internal" },
+    { symbol: "RUNTIME-SOURCE-ANALYSIS", kind: "function", visibility: "internal" },
+    { symbol: "DESKTOP-BRIDGE-STATE", kind: "class", visibility: "internal" }
+  ] as const;
 
   return {
     contractVersion: 1,
@@ -3011,16 +3023,10 @@ export function queryPackageBrowser(input: {
       ].filter((value, index, values) => values.indexOf(value) === index),
       nicknames: packageName === runtime.currentPackage ? ["SAU"] : [],
       useList: ["COMMON-LISP"],
-      externalSymbols: [
-        { symbol: "START-SHELL", kind: "function", visibility: "external" },
-        { symbol: "RUN-CONVERSATION-TURN", kind: "generic-function", visibility: "external" },
-        { symbol: "MAKE-DEFAULT-ENVIRONMENT", kind: "function", visibility: "external" }
-      ],
-      internalSymbols: [
-        { symbol: "CURRENT-THREAD", kind: "variable", visibility: "internal" },
-        { symbol: "RUNTIME-SOURCE-ANALYSIS", kind: "function", visibility: "internal" },
-        { symbol: "DESKTOP-BRIDGE-STATE", kind: "class", visibility: "internal" }
-      ],
+      externalSymbolCount: externalSymbols.length,
+      internalSymbolCount: internalSymbols.length,
+      externalSymbols: includeSymbols ? [...externalSymbols] : [],
+      internalSymbols: includeSymbols ? [...internalSymbols] : [],
       summary: `${packageName} exposes live namespace structure for browsing exported and internal symbols.`
     },
     metadata: {

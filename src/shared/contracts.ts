@@ -1309,7 +1309,7 @@ export interface RuntimeEntityDetailDto {
 export interface PackageBrowserSymbolDto {
   symbol: string;
   kind: "function" | "variable" | "macro" | "class" | "generic-function" | "unknown";
-  visibility: "external" | "internal";
+  visibility: "external" | "internal" | "inherited";
 }
 
 export interface PackageBrowserDto {
@@ -1317,6 +1317,8 @@ export interface PackageBrowserDto {
   availablePackages: string[];
   nicknames: string[];
   useList: string[];
+  externalSymbolCount: number;
+  internalSymbolCount: number;
   externalSymbols: PackageBrowserSymbolDto[];
   internalSymbols: PackageBrowserSymbolDto[];
   summary: string;
@@ -1581,7 +1583,7 @@ export interface TranscriptWorkspaceDto {
 export interface EnvironmentBootstrapDto {
   summary: EnvironmentSummaryDto;
   status: EnvironmentStatusDto;
-  workspaceSummary: WorkspaceSummaryDto;
+  workspaceSummary?: WorkspaceSummaryDto | null;
   desktopModel: DesktopModelDto;
 }
 
@@ -2075,6 +2077,15 @@ export interface EventSubscriptionHandle {
   subscriptionId: string;
 }
 
+export interface DesktopRefreshEventDto {
+  environmentId?: string | null;
+  domains: string[];
+  reason: string;
+  source: string;
+  timestamp: string;
+  entityId?: string | null;
+}
+
 export interface HostApi {
   getHostStatus(): Promise<HostStatusDto>;
   getCurrentBinding(): Promise<BindingDto | null>;
@@ -2140,6 +2151,7 @@ export interface QueryApi {
   packageBrowser(input: {
     environmentId: string;
     packageName?: string;
+    includeSymbols?: boolean;
   }): Promise<QueryResultDto<PackageBrowserDto>>;
   runtimeSymbolPage(input: RuntimeSymbolBrowserPageInput): Promise<QueryResultDto<RuntimeSymbolBrowserPageDto>>;
   fileSystemDirectory(input?: FileSystemDirectoryInput): Promise<QueryResultDto<FileSystemDirectoryListingDto>>;
@@ -2357,6 +2369,9 @@ export interface EventApi {
   subscribeEnvironmentEvents(
     input: EventSubscriptionInput,
     handler: (event: EnvironmentEventDto) => void
+  ): Promise<EventSubscriptionHandle>;
+  subscribeRefreshEvents(
+    handler: (event: DesktopRefreshEventDto) => void
   ): Promise<EventSubscriptionHandle>;
   subscribeConversationStream(
     handler: (event: EnvironmentEventDto) => void

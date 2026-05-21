@@ -11,6 +11,7 @@ Possible causes:
 - the app is running in mock mode
 - the live host adapter is not configured
 - the environment is not bound
+- the renderer and live environment binding drifted apart
 
 Check:
 
@@ -49,6 +50,8 @@ Possible causes:
 - mock data is active
 - the live adapter is not yet wired to the needed service path
 
+In live mode, also check whether the Browser surface is showing the expected environment identity. Browser often reveals binding-health problems earlier than conversation or workflow surfaces because it reads directly from the introspective runtime.
+
 ## Listener Or Inspector Does Not Behave Correctly
 
 Check:
@@ -65,6 +68,8 @@ Possible causes:
 - the current environment simply has no active governed records
 - mock state does not include the scenario you expect
 - the live service host is not supplying the relevant domain yet
+
+Because these surfaces are actor- and governance-driven, “empty” can also mean the live environment currently has no active approval, work, or incident state. Check whether the environment is healthy before assuming the UI is broken.
 
 ## Theme Looks Partly Wrong
 
