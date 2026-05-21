@@ -49,6 +49,15 @@ That alignment now includes planning context as well as execution context. The b
 
 `Surface` does not expose that packet as a single raw object, but it increasingly presents the environment, project, conversation, execution, and orchestration surfaces that produce it.
 
+The missing mental model in many agent systems is the feedback cycle. In `sbcl-agent`, the environment is not just a target and not just a telemetry source. It is an integrated part of the agent's live context:
+
+- the environment supplies the runtime, workflow, governance, and evidence state the agent reasons from
+- the agent itself operates inside that same environment
+- the effects of the agent's work become new environment state
+- the next planning/context packet is then built from that updated environment
+
+That is why the environment has to be introspective and durable. The agent is not reasoning from an external shadow model. It is participating in the same system that it is reading and changing.
+
 ## Realtime Introspective Environment Architecture
 
 The diagram below shows the architectural distinction that drives the whole system. `sbcl-agent` and `Surface` are not arranged like a traditional external agent supervising a target environment from the outside. The agent executes inside the same live SBCL environment that holds runtime state, transcript, memory, governance, evidence, and desktop state.
@@ -67,6 +76,14 @@ flowchart LR
     Runtime --> Workflow
 ```
 
+The important consequence is that this is a closed feedback loop:
+
+1. the environment exposes live state
+2. that live state becomes agent context
+3. the agent acts from inside the environment
+4. those actions create new environment state
+5. the next turn is planned from that updated environment
+
 ## Execution And Actor Architecture
 
 At the center of that environment is a shared execution substrate plus an actor runtime: `invoke`, `inspect`, and `control` govern how runtime work happens, while the actor system owns message-driven workflow continuity and governance-aware execution.
@@ -81,6 +98,101 @@ flowchart TB
     React --> Actor
     Actor --> Core
     Core --> Runtime
+```
+
+Actors should be understood here as internal tools of the environment, not just as an implementation detail behind UI panels.
+
+That distinction matters. `sbcl-agent` can still talk to MCP servers and other external integrations, but the main operating model is not "UI calls MCP directly." The stronger model is:
+
+- the environment exposes governed capabilities
+- actors own continuity, message flow, and supervision
+- the shared execution substrate runs the work
+- MCP remains an integration boundary, not the main internal control plane
+
+This is more scalable because the system can grow by adding actor identities, queues, pooled workers, and governed workflows without making the desktop transcript or frontend state responsible for continuity.
+
+## How Context Is Produced
+
+The desktop should be understood as a projection of a larger context-production pipeline.
+
+That pipeline pulls from several environment dimensions at once:
+
+- source state
+- runtime/image state
+- workflow and conversation state
+- governance and approval posture
+- project targeting and project authority
+- evidence, incidents, and validation outcomes
+- capability and provider-route readiness
+
+Those inputs are then narrowed into a planning packet that the integrated agent consumes. The desktop surfaces only pieces of that packet directly, but it increasingly exposes the domains that produce it.
+
+```mermaid
+flowchart LR
+    Browser["Browser / Runtime Inspection"]
+    Conversations["Conversation / Thread State"]
+    Workflow["Approvals / Incidents / Work-items"]
+    Project["Project Authority / Targeting"]
+    Capability["Provider / Capability Readiness"]
+    Packet["Planning Packet"]
+    Agent["Integrated Agent"]
+
+    Browser --> Packet
+    Conversations --> Packet
+    Workflow --> Packet
+    Project --> Packet
+    Capability --> Packet
+    Packet --> Agent
+```
+
+This is why the desktop is better understood as a projection of context production rather than just a collection of disconnected workspaces.
+
+## Why This Loop Is Harder To Reproduce With An Externalized Agent
+
+An external coding agent usually has to reconstruct reality from outside:
+
+- repo snapshot
+- shell output
+- tool responses
+- service calls
+- ticket or chat context
+
+That can work, but it is inherently lossy. The agent is outside the system and has to rebuild state across boundaries between calls.
+
+`sbcl-agent` is tighter because:
+
+- the environment is the source of context
+- the agent is part of that environment
+- actions create new environment state
+- that new state is immediately available for the next planning step
+
+The result is a shorter development loop:
+
+1. inspect live environment truth
+2. act inside that same environment
+3. observe the new runtime/workflow/evidence state
+4. plan the next step from that updated truth
+
+That is difficult to reproduce fully with an externalized agent, because the external agent does not naturally own the runtime, the workflow record, the approvals, and the evidence trail as one integrated environment.
+
+```mermaid
+flowchart LR
+    ExtInspect["External Agent Inspect"]
+    ExtTool["External Tool Call"]
+    ExtSummary["Transcript / Tool Summary"]
+    ExtReconstruct["Reconstruct State"]
+    ExtInspect --> ExtTool --> ExtSummary --> ExtReconstruct --> ExtInspect
+```
+
+By contrast, the self-hosted `sbcl-agent` loop is:
+
+```mermaid
+flowchart LR
+    EnvInspect["Environment Inspect"]
+    AgentPlan["Agent Plan"]
+    ActorExec["Actor-Governed Execution"]
+    EnvUpdate["Environment Update"]
+    EnvInspect --> AgentPlan --> ActorExec --> EnvUpdate --> EnvInspect
 ```
 
 ## The System Keeps Three Realities Together
@@ -187,6 +299,36 @@ flowchart LR
     Runtime --> Provider
     Policy --> Provider
 ```
+
+What is important in the current implementation is that the conversation layer is not doing naive prompt stuffing. It is using the dynamic context pipeline described in the backend docs:
+
+- gather environment and conversation truth
+- gather project and governance posture
+- retrieve broadly
+- select decisively
+- preserve uncertainty
+- then route execution
+
+That means the conversation surface is increasingly a view over context production and context consumption, not just a message log.
+
+## Planning Workflow And Iterative Loop
+
+The planning workflow agent implementation is best understood as this loop:
+
+```mermaid
+flowchart LR
+    Inspect["Inspect Runtime / Workflow / Project Truth"]
+    Select["Select Decisive Context"]
+    Plan["Plan Under Current Authority"]
+    Route["Route To Actor-Governed Capability"]
+    Execute["Execute / Inspect / Mutate"]
+    Emit["Emit Evidence / Incident / Approval / Artifact"]
+    Update["Update Environment State"]
+
+    Inspect --> Select --> Plan --> Route --> Execute --> Emit --> Update --> Inspect
+```
+
+This is the practical form of the self-hosted introspective process. The environment is continuously re-materialized as the next planning surface.
 
 ## The Browser Is A Live Image Browser
 

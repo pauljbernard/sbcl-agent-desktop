@@ -26,6 +26,54 @@ The backend also treats conversation planning context more explicitly than older
 - governed continuation posture
 - uncertainty that should block or shape the next step
 
+## End-To-End Conversation, Planning, And Mutation Process
+
+The conversation surface should be understood as the front door to a larger environment process.
+
+When the system is working correctly, the path is:
+
+1. a user submits an intent in Context Chat
+2. the thread and turn establish continuity for that work
+3. the backend gathers dynamic context from the environment:
+   - runtime state
+   - project targeting
+   - workflow and approval posture
+   - retrieval evidence
+   - capability and provider readiness
+4. the integrated agent plans within that context rather than from transcript alone
+5. actor-governed execution routes the work into the appropriate capability path
+6. code creation, code mutation, inspection, approvals, incidents, and artifacts are emitted back into the same environment
+7. the next turn is then planned from the updated environment truth
+
+That is why conversation here is not just chat. It is the conversational control surface for a self-hosted engineering loop.
+
+```mermaid
+flowchart LR
+    Chat["Context Chat Intent"]
+    Turn["Thread / Turn Continuity"]
+    Context["Dynamic Context Assembly"]
+    Plan["Integrated Agent Planning"]
+    Actor["Actor-Governed Capability"]
+    Result["Artifacts / Evidence / Incidents / Replies"]
+    Env["Updated Environment"]
+
+    Chat --> Turn --> Context --> Plan --> Actor --> Result --> Env --> Context
+```
+
+## Why This Is Stronger Than Traditional External Agent Comparators
+
+The usual external coding-agent model starts from files, shell output, and transcript, then tries to reconstruct the rest of the world from outside.
+
+This system was designed to be more robust than that model:
+
+- it does not depend only on file truth
+- it uses the live runtime as part of context
+- it carries workflow and governance state in the same environment
+- it keeps incidents, approvals, artifacts, and evidence attached to the work itself
+- it replans from updated environment truth after each meaningful action
+
+So the advantage is not only that it can mutate code. The advantage is that code creation and mutation are only one part of a more complete engineering loop that includes context, governance, execution, and evidence inside one system.
+
 ## Threads
 
 Use `Threads` when you want the broad conversation view.
