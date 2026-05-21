@@ -18,6 +18,14 @@ The desktop treats conversations as governed runtime objects with:
 
 The important architectural point is that conversation is not just transcript state. A conversation thread is one control surface over the same live environment that also contains runtime entities, workflow records, approvals, incidents, and evidence.
 
+The backend also treats conversation planning context more explicitly than older docs implied. A conversation can carry not only transcript continuity but also:
+
+- project-aware frame of reference
+- linked runtime entities
+- linked work-items and incidents
+- governed continuation posture
+- uncertainty that should block or shape the next step
+
 ## Threads
 
 Use `Threads` when you want the broad conversation view.
@@ -62,9 +70,10 @@ Current draft behavior assumes:
 ## Recommended Workflow
 
 1. pick the active thread
-2. inspect the relevant turn if you need lifecycle detail
-3. draft the next step only after you understand the linked context
-4. move into Execution or Evidence if the next action depends on direct runtime or artifact inspection
+2. confirm the surrounding project or workflow context when the request is not self-evident
+3. inspect the relevant turn if you need lifecycle detail
+4. draft the next step only after you understand the linked context
+5. move into Execution, Projects, or Evidence if the next action depends on direct runtime, governed project, or artifact inspection
 
 ## Important Distinction
 
