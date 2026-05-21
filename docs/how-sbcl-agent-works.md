@@ -175,6 +175,24 @@ The result is a shorter development loop:
 
 That is difficult to reproduce fully with an externalized agent, because the external agent does not naturally own the runtime, the workflow record, the approvals, and the evidence trail as one integrated environment.
 
+One way to explain this shift is through the old move from markup-driven word processing to WYSIWYG word processing.
+
+In the older model, you edit markup, run a formatter, and then inspect the rendered result. A lot of traditional software engineering and external coding-agent work still feels like that:
+
+- edit files
+- run tools
+- read logs and outputs
+- reconstruct what the system now is
+
+`sbcl-agent` aims for the WYSIWYG analogue for software engineering and agentic development:
+
+- inspect the live environment directly
+- act inside that same environment
+- see the updated runtime, workflow, and evidence state immediately
+- continue from the new truth without leaving the environment
+
+The claim is not that source files stop mattering. The claim is that the engineering loop becomes much more direct when source, runtime, workflow, and agent activity are different views over one live system rather than disconnected artifacts that have to be reconciled after the fact.
+
 ```mermaid
 flowchart LR
     ExtInspect["External Agent Inspect"]
